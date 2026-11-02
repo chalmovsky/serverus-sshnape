@@ -5,7 +5,7 @@
 # =============================================================================
 # Usage: ./serverus-sshnape.sh <ip-or-domain>
 #
-# For Ubuntu servers. This script will:
+# For Debian servers (12 or newer). Ubuntu works but is not recommended. This script will:
 #   1. Create an SSH key for this server
 #   2. Copy it to the server (prompts for password once)
 #   3. Remember the server's key in ~/.ssh/config, so `ssh root@<ip>` works
@@ -357,13 +357,23 @@ fail() { echo -e "${RED}✖${NC} $1"; }
 # Most steps run with their output hidden - never stop without saying where
 trap 'fail "Stopped at: $BASH_COMMAND"' ERR
 
-# Ubuntu only
+# Debian (12+) or Ubuntu only
 PRETTY_NAME="an unknown system"
 [ -f /etc/os-release ] && . /etc/os-release
-if [ "${ID:-}" != "ubuntu" ]; then
-    fail "This is $PRETTY_NAME. Only Ubuntu is supported. Nothing was changed."
-    exit 1
-fi
+case "${ID:-}" in
+    debian)
+        # testing/sid have no VERSION_ID - let those through
+        if [ -n "${VERSION_ID:-}" ] && [ "${VERSION_ID%%.*}" -lt 12 ] 2>/dev/null; then
+            fail "This is $PRETTY_NAME. Debian 12 or newer is needed. Nothing was changed."
+            exit 1
+        fi
+        ;;
+    ubuntu) ;;
+    *)
+        fail "This is $PRETTY_NAME. Only Debian and Ubuntu are supported. Nothing was changed."
+        exit 1
+        ;;
+esac
 
 # On re-runs, pause the alert watcher so it doesn't report this script's own
 # changes. Restarted even if we bail out halfway.
@@ -720,8 +730,11 @@ fi
 # A full disk takes the app down with it - SQLite can't write, deploys fail.
 # Unbounded logs are the usual way a box you don't babysit gets there.
 mkdir -p /etc/systemd/journald.conf.d
+# Persistent: Debian without rsyslog has no auth.log, the journal is the only
+# login history, and security-check reads 7 days of it.
 cat > /etc/systemd/journald.conf.d/00-serverus-sshnape.conf << 'EOF'
 [Journal]
+Storage=persistent
 SystemMaxUse=500M
 EOF
 systemctl restart systemd-journald > /dev/null 2>&1 || true
@@ -811,8 +824,9 @@ ok "Kernel: SYN cookies, no redirects, no source routing"
 # Configure Automatic Updates
 # -------------------------------------------------------------------------
 
-# Ubuntu's own 50unattended-upgrades knows which updates are security
+# The distro's own 50unattended-upgrades knows which updates are security
 # updates, so it stays as it is and our settings go in a file next to it.
+# (Debian's also takes stable point releases, which are fixes only.)
 
 # Kernel fixes do nothing until a reboot. Reboot only when an update
 # actually needs it, at a quiet hour (server time is UTC).
@@ -1255,23 +1269,26 @@ done
 # Ubuntu's login banner advertises Ubuntu Pro, ESM and docs links on every
 # login. Turn those parts off; updates pending, reboot required and new
 # release stay. chmod -x is how update-motd parts are meant to be disabled.
-for part in 10-help-text 50-motd-news 88-esm-announce 91-contract-ua-esm-status 90-updates-available; do
-    [ -f "/etc/update-motd.d/$part" ] && chmod -x "/etc/update-motd.d/$part"
-done
-[ -f /etc/default/motd-news ] && sed -i 's/^ENABLED=.*/ENABLED=0/' /etc/default/motd-news
-systemctl disable --now motd-news.timer > /dev/null 2>&1 || true
-command -v pro > /dev/null 2>&1 && pro config set apt_news=false > /dev/null 2>&1 || true
+# Debian has none of this, so it's Ubuntu only.
+if [ "$ID" = "ubuntu" ]; then
+    for part in 10-help-text 50-motd-news 88-esm-announce 91-contract-ua-esm-status 90-updates-available; do
+        [ -f "/etc/update-motd.d/$part" ] && chmod -x "/etc/update-motd.d/$part"
+    done
+    [ -f /etc/default/motd-news ] && sed -i 's/^ENABLED=.*/ENABLED=0/' /etc/default/motd-news
+    systemctl disable --now motd-news.timer > /dev/null 2>&1 || true
+    command -v pro > /dev/null 2>&1 && pro config set apt_news=false > /dev/null 2>&1 || true
 
-# The update count, minus the ESM lines Ubuntu mixes into it
-cat > /etc/update-motd.d/90-serverus-sshnape-updates << 'EOF'
+    # The update count, minus the ESM lines Ubuntu mixes into it
+    cat > /etc/update-motd.d/90-serverus-sshnape-updates << 'EOF'
 #!/bin/sh
 # Managed by serverus-sshnape: 90-updates-available without the ESM ads
 stamp=/var/lib/update-notifier/updates-available
 [ -r "$stamp" ] || exit 0
 grep -viE 'esm|expanded security|pro status' "$stamp" | cat -s
 EOF
-chmod 755 /etc/update-motd.d/90-serverus-sshnape-updates
-ok "Login message: no Ubuntu Pro ads"
+    chmod 755 /etc/update-motd.d/90-serverus-sshnape-updates
+    ok "Login message: no Ubuntu Pro ads"
+fi
 
 # -------------------------------------------------------------------------
 # Lock root password
@@ -1280,7 +1297,7 @@ passwd -l root > /dev/null 2>&1
 ok "Root password locked"
 
 # Root isn't always the only way in: cloud images come with a default user
-# ("ubuntu"), usually with passwordless sudo
+# ("debian", "ubuntu"), usually with passwordless sudo
 OTHERS=$(awk -F: '$3 >= 1000 && $3 < 65000 && $7 !~ /(nologin|false)$/ {print $1 ":" $6}' /etc/passwd | \
     while IFS=: read -r ACCOUNT HOME_DIR; do
         if grep -qsE '^[[:space:]]*[^#[:space:]]' "$HOME_DIR/.ssh/authorized_keys" "$HOME_DIR/.ssh/authorized_keys2"; then

@@ -4,6 +4,8 @@ Secure a VPS with one command.
 
 Fresh VPS, one command, done. A few minutes later it's locked down and ready for your production apps.
 
+**Made for Debian 12 (bookworm) and 13 (trixie).** Pick Debian when your provider asks for an image. Ubuntu still works, but it's not recommended.
+
 ```bash
 curl -sLO https://raw.githubusercontent.com/chalmovsky/serverus-sshnape/main/serverus-sshnape.sh && chmod +x serverus-sshnape.sh && ./serverus-sshnape.sh <ip>
 ```
@@ -28,7 +30,7 @@ You type the root password once. That's the last time you'll ever need it.
 - Hardens kernel network settings: SYN cookies, no ICMP redirects, no source routing
 - auditd watches the SSH keys of every account that can log in, plus users, sudoers, cron, systemd and PAM
 - Disables cups, avahi, rpcbind and nfs if present
-- Takes the Ubuntu Pro and ESM ads out of the login message, keeps the update count
+- On Ubuntu: takes the Ubuntu Pro and ESM ads out of the login message, keeps the update count
 - Installs `security-check`: tells you "✅ All good" or what needs a look, then the details
 - Adds the key to your `~/.ssh/config`
 
@@ -38,7 +40,7 @@ Then connect with:
 ssh root@<ip>
 ```
 
-For Ubuntu servers. Run it from macOS or Linux.
+For Debian 12+ servers. Ubuntu works but is not recommended. Run it from macOS or Linux.
 
 Safe to re-run: firewall rules you added yourself are kept. Reinstalled the server? Run it again and pick "start fresh" - it forgets the old key and the old host key for you.
 
