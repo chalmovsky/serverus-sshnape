@@ -16,7 +16,8 @@
 #   8. Add a swap file if there is no swap
 #   9. Cap journal and Docker log sizes
 #  10. Harden kernel network settings
-#  11. Setup automatic security updates, rebooting at 04:00 UTC when needed
+#  11. Install pending security updates, then keep doing it automatically,
+#      rebooting at 04:00 UTC when needed
 #  12. Configure security auditing
 #  13. Lock root password
 #  14. Send critical alerts to Telegram, if you say yes when asked
@@ -133,7 +134,14 @@ if [ "$want_telegram" = "y" ] || [ "$want_telegram" = "Y" ]; then
         exit 1
     fi
 
-    BOT_NAME=$(curl -s --max-time 10 "https://api.telegram.org/bot$TG_TOKEN/getMe" | \
+    # The token reaches curl on stdin, not in its arguments, where `ps` shows it
+    tg_api() {
+        local method="$1"
+        shift
+        curl -s --max-time 10 "$@" -K - <<< "url = \"https://api.telegram.org/bot$TG_TOKEN/$method\""
+    }
+
+    BOT_NAME=$(tg_api getMe | \
         grep -oE '"username":"[^"]+"' | head -1 | cut -d'"' -f4)
     if [ -z "$BOT_NAME" ]; then
         print_error "Telegram rejected the token"
@@ -144,7 +152,7 @@ if [ "$want_telegram" = "y" ] || [ "$want_telegram" = "Y" ]; then
     # message is also how we learn your chat id.
     echo "Now send any message to @$BOT_NAME (waiting up to 2 minutes)"
     for _ in $(seq 1 60); do
-        TG_CHAT=$(curl -s --max-time 10 "https://api.telegram.org/bot$TG_TOKEN/getUpdates" | \
+        TG_CHAT=$(tg_api getUpdates | \
             grep -oE '"chat":\{"id":-?[0-9]+' | tail -1 | grep -oE -- '-?[0-9]+$' || true)
         [ -n "$TG_CHAT" ] && break
         sleep 2
@@ -156,10 +164,9 @@ if [ "$want_telegram" = "y" ] || [ "$want_telegram" = "Y" ]; then
         exit 1
     fi
     # Reply right away: proves the bot can send, not just receive
-    if ! curl -sf --max-time 10 -o /dev/null \
+    if ! tg_api sendMessage -f -o /dev/null \
         --data-urlencode "chat_id=$TG_CHAT" \
-        --data-urlencode "text=👋 Hello! Alerts will arrive here. Setting up the server now, you'll get a message when it's done." \
-        "https://api.telegram.org/bot$TG_TOKEN/sendMessage"; then
+        --data-urlencode "text=👋 Hello! Alerts will arrive here. Setting up the server now, you'll get a message when it's done."; then
         print_error "Could not send a message to this chat"
         exit 1
     fi
@@ -407,12 +414,16 @@ done
 INSTALL_LOG=$(mktemp)
 
 # python3-systemd: needed by fail2ban's systemd backend
+# nftables: Debian 13's fail2ban bans with `nft`, and the Debian cloud image
+# doesn't have it. apt won't add it on its own (iptables satisfies the same
+# Recommends), and then fail2ban runs but every ban fails.
 # Lock::Timeout: wait for another apt instead of failing on its lock.
 # force-confold: keep config files as they are, without asking
 if ! DEBIAN_FRONTEND=noninteractive apt-get install -y \
     -o DPkg::Lock::Timeout=300 -o Dpkg::Options::=--force-confold \
     ufw \
     fail2ban \
+    nftables \
     python3-systemd \
     curl \
     unattended-upgrades \
@@ -503,8 +514,12 @@ if ! sshd -t; then
     exit 1
 fi
 
-# Verify the effective config - catches any drop-in still overriding us
-SSHD_EFFECTIVE=$(sshd -T 2>/dev/null || true)
+# Verify the effective config - catches any drop-in still overriding us.
+# -C: as it applies to root connecting from where you are, so a Match block
+# that turns passwords back on is caught too. Plain -T skips Match blocks.
+SSHD_CLIENT="${SSH_CLIENT%% *}"
+SSHD_EFFECTIVE=$(sshd -T -C "user=root,host=${SSHD_CLIENT:-localhost},addr=${SSHD_CLIENT:-127.0.0.1}" 2>/dev/null || \
+    sshd -T 2>/dev/null || true)
 if ! echo "$SSHD_EFFECTIVE" | grep -qiE '^passwordauthentication\s+no'; then
     fail "Password auth still on in the effective config - restored the original. Check /etc/ssh/sshd_config.d/"
     restore_sshd_config
@@ -562,13 +577,19 @@ ok "Firewall: 22 (rate-limited), 80, 443 open${FW_KEPT:-, everything else closed
 #
 # This must run AFTER the firewall step: `ufw --force reset` restores a stock
 # after.rules.
-# ufw drops forwarded packets by default, which breaks container
-# networking outright. Hand filtering to DOCKER-USER instead.
+# Forwarded packets nothing allowed stay dropped, which is ufw's default.
+# Docker puts its own rules ahead of ufw's in the FORWARD chain, so containers
+# don't need the policy opened - and ACCEPT lets the box route anything, on
+# IPv4 and IPv6. Earlier versions of this script set ACCEPT; this undoes it.
 if grep -qE '^DEFAULT_FORWARD_POLICY=' /etc/default/ufw; then
-    sed -i 's/^DEFAULT_FORWARD_POLICY=.*/DEFAULT_FORWARD_POLICY="ACCEPT"/' /etc/default/ufw
+    sed -i 's/^DEFAULT_FORWARD_POLICY=.*/DEFAULT_FORWARD_POLICY="DROP"/' /etc/default/ufw
 else
-    echo 'DEFAULT_FORWARD_POLICY="ACCEPT"' >> /etc/default/ufw
+    echo 'DEFAULT_FORWARD_POLICY="DROP"' >> /etc/default/ufw
 fi
+
+# For putting things back if the new rules don't load
+AFTER_RULES_BACKUP=$(mktemp)
+cp /etc/ufw/after.rules "$AFTER_RULES_BACKUP"
 
 # Idempotent: strip any block we added before, then append a fresh one
 if grep -q '^# BEGIN UFW AND DOCKER$' /etc/ufw/after.rules; then
@@ -591,6 +612,13 @@ cat >> /etc/ufw/after.rules << 'EOF'
 # Container DNS replies
 -A DOCKER-USER -p udp -m udp --sport 53 --dport 1024:65535 -j RETURN
 
+# Ports 80 and 443 of the server reach whichever container publishes them: a
+# containerised reverse proxy (kamal-proxy, Traefik, Caddy in Docker). Matched
+# on the port the client connected to, before Docker's NAT swapped in the
+# container's port - so `-p 8080:80` stays closed and `-p 80:3000` works.
+-A DOCKER-USER -p tcp -m conntrack --ctorigdstport 80 --ctdir ORIGINAL -j RETURN
+-A DOCKER-USER -p tcp -m conntrack --ctorigdstport 443 --ctdir ORIGINAL -j RETURN
+
 # Anything from outside aimed at a container gets dropped unless a ufw rule
 # allowed it. Published ports are no longer world-open by default.
 -A DOCKER-USER -j ufw-docker-logging-deny -p tcp -m tcp --tcp-flags FIN,SYN,RST,ACK SYN -d 192.168.0.0/16
@@ -609,14 +637,20 @@ COMMIT
 # END UFW AND DOCKER
 EOF
 
-# DOCKER-USER consults ufw's *route* rules, not the input rules above.
-# Without these, a containerised reverse proxy (kamal-proxy, Traefik,
-# Caddy in Docker) publishing 80/443 is unreachable from outside.
-ufw route allow proto tcp from any to any port 80 > /dev/null 2>&1
-ufw route allow proto tcp from any to any port 443 > /dev/null 2>&1
+# Earlier versions of this script opened 80/443 with `ufw route allow`. That
+# matches the port *inside* the container, so `-p 8080:80` was reachable from
+# the internet. The rules above replace them; your own route rules still work.
+ufw route delete allow proto tcp from any to any port 80 > /dev/null 2>&1 || true
+ufw route delete allow proto tcp from any to any port 443 > /dev/null 2>&1 || true
 
-ufw reload > /dev/null 2>&1 || true
-ok "Docker: containers reachable from outside on 80 and 443 only"
+if ufw reload > /dev/null 2>&1; then
+    ok "Docker: containers reachable from outside on 80 and 443 only"
+else
+    cp "$AFTER_RULES_BACKUP" /etc/ufw/after.rules
+    ufw reload > /dev/null 2>&1 || true
+    warn "Docker: new firewall rules did not load, the old after.rules is back. Published container ports may be open. Check: ufw reload"
+fi
+rm -f "$AFTER_RULES_BACKUP"
 
 # -------------------------------------------------------------------------
 # Configure Fail2ban
@@ -843,7 +877,21 @@ APT::Periodic::Update-Package-Lists "1";
 APT::Periodic::Unattended-Upgrade "1";
 APT::Periodic::AutocleanInterval "7";
 EOF
-ok "Updates: automatic, reboot at 04:00 UTC when needed"
+
+# Don't leave an old image unpatched until tonight's timer: do that run now.
+# Only what it would install anyway. Not `apt-get upgrade`: on a re-run that
+# would also upgrade Docker from its own repo and restart every container.
+echo "  Installing pending updates, this can take a few minutes"
+UPDATES_NOW="installed now, then automatic"
+if ! unattended-upgrade < /dev/null > /dev/null 2>&1; then
+    UPDATES_NOW="automatic"
+    warn "Updates: could not install them now, tonight's run will. Look: unattended-upgrade -d"
+fi
+if [ -f /var/run/reboot-required ]; then
+    ok "Updates: $UPDATES_NOW. Reboot pending, it happens at 04:00 UTC"
+else
+    ok "Updates: $UPDATES_NOW, reboot at 04:00 UTC when needed"
+fi
 
 # -------------------------------------------------------------------------
 # Configure Security Auditing
@@ -1331,10 +1379,12 @@ CONF=/etc/serverus-sshnape/telegram.env
 [ -r "$CONF" ] || { echo "Alerts not configured ($CONF missing)" >&2; exit 1; }
 [ $# -gt 0 ] || { echo "Usage: send-alert <message>" >&2; exit 1; }
 . "$CONF"
+# The URL holds the token: handed to curl on stdin, not as an argument, where
+# every user on the box could read it from `ps`
 curl -sf --max-time 10 -o /dev/null \
     --data-urlencode "chat_id=$TG_CHAT" \
     --data-urlencode "text=[$TG_LABEL] $*" \
-    "https://api.telegram.org/bot$TG_TOKEN/sendMessage"
+    -K - <<< "url = \"https://api.telegram.org/bot$TG_TOKEN/sendMessage\""
 EOF
     chmod 755 /usr/local/bin/send-alert
 
@@ -1690,6 +1740,21 @@ else
     FINAL_FAILED=1
 fi
 
+# Ask the server, from out here, what it accepts besides a key. With no key
+# and nothing to type the login fails, and the refusal lists the ways in that
+# are left: "Permission denied (publickey)". A connection of its own - through
+# the shared one we'd already be logged in.
+AUTH_OFFERED=$(ssh -o ControlPath=none -o BatchMode=yes -o PubkeyAuthentication=no -o ConnectTimeout=10 \
+    "root@$SERVER" true 2>&1 | grep -oE 'Permission denied \([^)]*\)' | head -1 | sed 's/.*(//; s/)$//' || true)
+if [ -z "$AUTH_OFFERED" ]; then
+    print_warning "Password login: could not verify it is refused"
+elif echo "$AUTH_OFFERED" | grep -qE 'password|keyboard-interactive'; then
+    print_error "Server still accepts: $AUTH_OFFERED. Password login is not off."
+    FINAL_FAILED=1
+else
+    print_success "Password login refused (server accepts: $AUTH_OFFERED)"
+fi
+
 # One connection for both checks, not two - see the SSH_MUX note above.
 STATUS_OUT=$(ssh -i "$KEY_PATH" "${SSH_MUX[@]}" -o ConnectTimeout=10 "root@$SERVER" '
     FW=$(ufw status 2>/dev/null | head -1 | sed "s/^Status: //")
@@ -1702,8 +1767,11 @@ FW_STATUS=$(echo "$STATUS_OUT" | sed -n 's/^FW=//p')
 F2B_STATUS=$(echo "$STATUS_OUT" | sed -n 's/^F2B=//p')
 FAILED_UNITS=$(echo "$STATUS_OUT" | sed -n 's/^FAILED=//p')
 
-if [ -n "$FW_STATUS" ] && [ "$FW_STATUS" != "unknown" ]; then
-    print_success "Firewall: $FW_STATUS"
+if [ "$FW_STATUS" = "active" ]; then
+    print_success "Firewall: active"
+elif [ -n "$FW_STATUS" ] && [ "$FW_STATUS" != "unknown" ]; then
+    print_error "Firewall: $FW_STATUS. On the server: ufw enable"
+    FINAL_FAILED=1
 else
     print_warning "Firewall: could not verify"
 fi

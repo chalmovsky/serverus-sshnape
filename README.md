@@ -21,9 +21,10 @@ You type the root password once. That's the last time you'll ever need it.
 - Checks the effective sshd config before restarting sshd
 - Locks the root password
 - Firewall: deny all incoming, allow 22 (rate-limited), 80, 443
-- Stops Docker from bypassing the firewall, containers are only reachable on 80 and 443
+- Stops Docker from bypassing the firewall, containers are only reachable on the server's ports 80 and 443
 - Fail2ban: 3 failed SSH logins = 1 hour ban, repeat offenders = 1 week
-- Automatic security updates, reboots at 04:00 UTC only when an update needs it
+- Installs pending security updates right away, then automatically, reboots at 04:00 UTC only when an update needs it
+- Checks from the outside that the server refuses password login
 - Time sync with chrony, timezone set to UTC
 - Adds a swap file if there is no swap, sized to RAM (1–4 GB)
 - Caps log sizes: journal at 500 MB, Docker at 10 MB × 3 per container
