@@ -87,7 +87,14 @@ A dead server can't text you, so use an outside uptime check for that.
 
 The script asks if you want a tunnel. Say yes and visitors reach your sites through Cloudflare instead of connecting to the server: free DDoS protection, and the server's IP appears in no DNS record. It works on Cloudflare's free plan.
 
-You need a Cloudflare account with your domain on it. In the dashboard go to Networking > Tunnels, create a tunnel (type Cloudflared) and copy the token from the install command it shows. Paste it when the script asks; don't run that command yourself. Then the script:
+You need a Cloudflare account with your domain on it. The script walks you through getting the token when it asks:
+
+1. In the [Cloudflare dashboard](https://dash.cloudflare.com) go to Networking > Tunnels and click Create Tunnel.
+2. Give it a name and click Create Tunnel.
+3. The page shows commands to install and run `cloudflared`. Don't run them. The token is the long `eyJ...` text at the end of the command: copy it, or the whole command. The operating system you pick there doesn't matter.
+4. Paste it into the script. Leave the page open: once the script is done it shows the tunnel as connected, and you click Continue.
+
+Then the script:
 
 - Installs `cloudflared` from Cloudflare's apt repo, kept up to date with the other automatic updates
 - Runs it as a service under its own account with no privileges. The token sits in a file only root and that service can read, never in a command line
@@ -98,7 +105,7 @@ You need a Cloudflare account with your domain on it. In the dashboard go to Net
 - Checks from your machine that 80 and 443 don't answer
 - With Telegram alerts on: texts you when the tunnel goes down and when it's back, and shows it in `/status`
 
-Then, in the tunnel's page, add a route for each hostname pointing at `http://127.0.0.1:80`. Your web server listens there in plain HTTP and Cloudflare does the HTTPS. With Caddy that means `http://example.com { ... }` site blocks and `default_bind 127.0.0.1`.
+Then put your sites on the tunnel. For each hostname: Networking > Tunnels > your tunnel > Routes > Add route > Published application, enter the hostname, set Service URL to `http://127.0.0.1:80` and click Add route. Cloudflare creates the DNS record itself. Your web server listens there in plain HTTP and Cloudflare does the HTTPS. With Caddy that means `http://example.com { ... }` site blocks and `default_bind 127.0.0.1`.
 
 The server remembers it is tunnel-only: re-running the script keeps 80 and 443 closed. To add a tunnel later, or swap the token, re-run and say yes. To go back: `rm /etc/serverus-sshnape/tunnel-only`, `systemctl disable --now cloudflared`, `ufw delete reject out 25/tcp`, and re-run.
 
