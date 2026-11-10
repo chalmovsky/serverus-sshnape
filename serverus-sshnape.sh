@@ -21,6 +21,8 @@
 #  12. Configure security auditing
 #  13. Lock root password
 #  14. Send critical alerts to Telegram, if you say yes when asked
+#  15. Put the server behind a Cloudflare Tunnel, if you say yes when asked:
+#      80 and 443 closed, sites reachable through Cloudflare only
 # =============================================================================
 
 set -e
@@ -171,6 +173,31 @@ if [ "$want_telegram" = "y" ] || [ "$want_telegram" = "Y" ]; then
         exit 1
     fi
     print_success "Telegram: @$BOT_NAME said hello"
+fi
+
+# Asked up front as well. The token is hidden like Telegram's, and reaches the
+# server the same way: on stdin, never in a command line.
+CF_TOKEN=""
+echo ""
+echo "Cloudflare Tunnel: visitors reach your sites through Cloudflare. Free DDoS protection,"
+echo "and the server's IP stays out of DNS. Ports 80 and 443 get closed: the tunnel becomes"
+echo "the only way in besides SSH. Needs a free Cloudflare account with your domain on it."
+read -rp "Set up a Cloudflare Tunnel? (y/n) [n]: " want_tunnel
+if [ "$want_tunnel" = "y" ] || [ "$want_tunnel" = "Y" ]; then
+    echo "Cloudflare dashboard: Networking > Tunnels > Create a tunnel > Cloudflared."
+    echo "It shows an install command that ends in a long token (eyJ...)."
+    echo "Paste the token here, or the whole command. Don't run that command yourself."
+    read -rsp "Tunnel token: " CF_INPUT
+    echo ""
+
+    # A token is base64 of a small JSON object, so it always starts with eyJ
+    CF_TOKEN=$(printf '%s\n' "$CF_INPUT" | grep -oE 'eyJ[A-Za-z0-9+/_=-]{80,}' | tail -1 || true)
+    CF_INPUT=""
+    if [ -z "$CF_TOKEN" ]; then
+        print_error "Not a tunnel token (expected eyJ... about 180 characters)"
+        exit 1
+    fi
+    print_success "Tunnel token read. Whether it works shows once the server connects with it."
 fi
 
 
@@ -342,11 +369,11 @@ fi
 # -----------------------------------------------------------------------------
 print_step "Server"
 
-# The Telegram token travels on stdin with the script, not on the command
-# line, where `ps` on the server would show it.
+# The Telegram and tunnel tokens travel on stdin with the script, not on the
+# command line, where `ps` on the server would show them.
 REMOTE_STATUS=0
 {
-    printf 'TG_TOKEN=%q\nTG_CHAT=%q\n' "$TG_TOKEN" "$TG_CHAT"
+    printf 'TG_TOKEN=%q\nTG_CHAT=%q\nCF_TOKEN=%q\n' "$TG_TOKEN" "$TG_CHAT" "$CF_TOKEN"
     cat << 'REMOTE_SCRIPT'
 #!/bin/bash
 
@@ -390,6 +417,15 @@ if systemctl cat serverus-sshnape-watch.timer > /dev/null 2>&1; then
 fi
 
 ok "OS: $PRETTY_NAME"
+
+# A VPS a few minutes old is often still in its own first-boot setup
+# (cloud-init): upgrading every package, installing more. That holds the apt
+# lock on and off for minutes and makes the update step below fail on it.
+# Only waits while it is actually running; capped, so a stuck one can't hang us.
+if command -v cloud-init > /dev/null 2>&1 && cloud-init status 2> /dev/null | grep -q '^status: running'; then
+    echo "  The server is still finishing its first-boot setup, waiting for it"
+    timeout 600 cloud-init status --wait > /dev/null 2>&1 || true
+fi
 
 # -------------------------------------------------------------------------
 # Update system
@@ -536,6 +572,178 @@ rm -f "$SSHD_BACKUP"
 ok "SSH: key only, no passwords"
 
 # -------------------------------------------------------------------------
+# Cloudflare Tunnel
+# -------------------------------------------------------------------------
+# Before the firewall, because the firewall depends on it: on a tunnel-only
+# server 80 and 443 are closed, and they are only closed once the tunnel has
+# been seen connected - a mistyped token must not take a site offline.
+#
+# Tunnel-only is remembered on the server (the tunnel-only file), so a plain
+# re-run keeps the ports closed instead of opening them again.
+CF_DIR=/etc/serverus-sshnape
+CF_TOKEN_FILE=$CF_DIR/cloudflared-token
+CF_UNIT=/etc/systemd/system/cloudflared.service
+TUNNEL_ONLY_MARK=$CF_DIR/tunnel-only
+mkdir -p "$CF_DIR" /usr/local/lib/serverus-sshnape
+
+cat > /usr/local/lib/serverus-sshnape/tunnel-state << 'EOF'
+#!/bin/bash
+# Prints "up" or "down": does cloudflared hold a connection to Cloudflare?
+# cloudflared answers /ready on its metrics port: 200 with a connection, 503
+# without. Ours is pinned to 20241; one set up by hand takes the first free
+# port of 20241-20245.
+for PORT in 20241 20242 20243 20244 20245; do
+    CODE=$(curl -s --max-time 3 -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PORT/ready" 2>/dev/null)
+    case "$CODE" in
+        200) echo up; exit 0 ;;
+        503) echo down; exit 1 ;;
+    esac
+done
+# No answer anywhere: an old cloudflared on a random metrics port. systemd
+# calls the service active once it has connected.
+if systemctl is-active --quiet cloudflared; then
+    echo up
+    exit 0
+fi
+echo down
+exit 1
+EOF
+chmod 755 /usr/local/lib/serverus-sshnape/tunnel-state
+
+# cloudflared isn't in Debian. Cloudflare's own apt repo, so apt keeps it
+# updated (see the automatic updates step).
+install_cloudflared() {
+    install -d -m 0755 /usr/share/keyrings || return 1
+    curl -fsSL --max-time 30 -o /usr/share/keyrings/cloudflare-main.gpg.new \
+        https://pkg.cloudflare.com/cloudflare-main.gpg || return 1
+    mv /usr/share/keyrings/cloudflare-main.gpg.new /usr/share/keyrings/cloudflare-main.gpg || return 1
+    echo 'deb [signed-by=/usr/share/keyrings/cloudflare-main.gpg] https://pkg.cloudflare.com/cloudflared any main' \
+        > /etc/apt/sources.list.d/cloudflared.list || return 1
+    apt-get update < /dev/null > /dev/null 2>&1 || return 1
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -o DPkg::Lock::Timeout=300 cloudflared \
+        < /dev/null > /dev/null 2>&1 || return 1
+}
+
+# Not `cloudflared service install <token>`: that takes the token as a command
+# line argument. The token goes into a file that root and the service can read,
+# nobody else. The service runs as its own account with no privileges: all it
+# does is make outgoing connections and talk to your web server on 127.0.0.1.
+write_cloudflared_unit() {
+    cat > "$CF_UNIT" << 'EOF'
+# Managed by serverus-sshnape
+[Unit]
+Description=Cloudflare Tunnel
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# notify: cloudflared reports ready once it is connected to Cloudflare, so a
+# start that succeeds means the tunnel is up
+Type=notify
+TimeoutStartSec=30
+User=cloudflared
+Group=cloudflared
+Environment=TUNNEL_METRICS=127.0.0.1:20241
+ExecStart=/usr/bin/cloudflared --no-autoupdate tunnel run --token-file /etc/serverus-sshnape/cloudflared-token
+Restart=always
+RestartSec=5s
+
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+}
+
+# Up to 20 seconds for the first connection
+tunnel_connected() {
+    local _
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+        [ "$(/usr/local/lib/serverus-sshnape/tunnel-state)" = up ] && return 0
+        sleep 2
+    done
+    return 1
+}
+
+if [ -n "$CF_TOKEN" ]; then
+    echo "  Setting up the Cloudflare Tunnel"
+    if ! install_cloudflared; then
+        fail "Tunnel: could not install cloudflared from pkg.cloudflare.com. Nothing changed for the tunnel; run again to retry."
+    else
+        # What is there now, to put back if the new token doesn't connect: a
+        # tunnel from an earlier run, or one set up by hand
+        CF_OLD=$(mktemp -d)
+        [ -f "$CF_UNIT" ] && cp -p "$CF_UNIT" "$CF_OLD/unit"
+        [ -f "$CF_TOKEN_FILE" ] && cp -p "$CF_TOKEN_FILE" "$CF_OLD/token"
+
+        id cloudflared > /dev/null 2>&1 || \
+            useradd --system --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin cloudflared
+        ( umask 077; printf '%s\n' "$CF_TOKEN" > "$CF_TOKEN_FILE" )
+        chown root:cloudflared "$CF_TOKEN_FILE"
+        chmod 640 "$CF_TOKEN_FILE"
+        write_cloudflared_unit
+
+        # The tunnel speaks QUIC, which wants larger UDP buffers than the
+        # kernel allows by default. Without this cloudflared warns at every
+        # start and is slower under load. Raises the ceiling only.
+        cat > /etc/sysctl.d/99-serverus-sshnape-tunnel.conf << 'EOF'
+# Managed by serverus-sshnape: UDP buffer ceiling for cloudflared (QUIC)
+net.core.rmem_max = 7500000
+net.core.wmem_max = 7500000
+EOF
+        sysctl -q -p /etc/sysctl.d/99-serverus-sshnape-tunnel.conf > /dev/null 2>&1 || true
+
+        systemctl daemon-reload
+        systemctl enable cloudflared > /dev/null 2>&1 || true
+
+        if systemctl restart cloudflared > /dev/null 2>&1 && tunnel_connected; then
+            touch "$TUNNEL_ONLY_MARK"
+            ok "Tunnel: connected to Cloudflare"
+        elif [ -f "$CF_OLD/unit" ]; then
+            cp -p "$CF_OLD/unit" "$CF_UNIT"
+            if [ -f "$CF_OLD/token" ]; then cp -p "$CF_OLD/token" "$CF_TOKEN_FILE"; else rm -f "$CF_TOKEN_FILE"; fi
+            systemctl daemon-reload
+            systemctl restart cloudflared > /dev/null 2>&1 || true
+            fail "Tunnel: the new token did not connect, so the tunnel that was here before is back. Copy the token again from the tunnel's page and re-run."
+        else
+            systemctl disable --now cloudflared > /dev/null 2>&1 || true
+            rm -f "$CF_UNIT" "$CF_TOKEN_FILE"
+            systemctl daemon-reload
+            fail "Tunnel: the token did not connect (wrong token, or the tunnel was deleted?). Nothing changed for the tunnel. Copy it again from the tunnel's page and re-run."
+        fi
+        rm -rf "$CF_OLD"
+    fi
+fi
+
+# Where this server stands now
+TUNNEL_ONLY=""
+TUNNEL_BY_HAND=""
+if [ -f "$TUNNEL_ONLY_MARK" ]; then
+    TUNNEL_ONLY=1
+    if [ -z "$CF_TOKEN" ]; then
+        if [ "$(/usr/local/lib/serverus-sshnape/tunnel-state)" = up ]; then
+            ok "Tunnel: kept, connected to Cloudflare"
+        else
+            warn "Tunnel: kept, but not connected right now. Look: journalctl -u cloudflared -n 30"
+        fi
+    fi
+elif systemctl is-enabled --quiet cloudflared 2> /dev/null; then
+    # cloudflared someone installed themselves. Could be the only way in, could
+    # sit next to sites served directly - not ours to decide.
+    TUNNEL_BY_HAND=1
+fi
+
+# -------------------------------------------------------------------------
 # Configure Firewall
 # -------------------------------------------------------------------------
 
@@ -549,6 +757,16 @@ else
     ufw --force reset > /dev/null 2>&1
 fi
 
+# ufw has to filter IPv6 as well, or every port is open on the server's IPv6
+# address. It does by default; put it back if someone switched it off.
+if [ -e /proc/net/if_inet6 ] && ! grep -q '^IPV6=yes' /etc/default/ufw; then
+    if grep -q '^IPV6=' /etc/default/ufw; then
+        sed -i 's/^IPV6=.*/IPV6=yes/' /etc/default/ufw
+    else
+        echo 'IPV6=yes' >> /etc/default/ufw
+    fi
+fi
+
 # Set defaults
 ufw default deny incoming > /dev/null 2>&1
 ufw default allow outgoing > /dev/null 2>&1
@@ -557,14 +775,46 @@ ufw default allow outgoing > /dev/null 2>&1
 # 'limit' blocks IPs making 6+ connections in 30 seconds
 ufw limit 22/tcp > /dev/null 2>&1
 
-# Allow common web ports (comment out if not needed)
-ufw allow 80/tcp > /dev/null 2>&1
-ufw allow 443/tcp > /dev/null 2>&1
+if [ -n "$TUNNEL_ONLY" ]; then
+    # Sites come in through the tunnel. An open 80 or 443 is how scanners
+    # (Censys, Shodan) tie a domain to the server's IP within hours.
+    ufw delete allow 80/tcp > /dev/null 2>&1 || true
+    ufw delete allow 443/tcp > /dev/null 2>&1 || true
+    # Mail a server delivers itself carries its IP in the headers. Port 25 is
+    # only used for that; sending through a mail API (HTTPS, or SMTP on 587)
+    # is not affected.
+    ufw reject out 25/tcp > /dev/null 2>&1
+elif [ -n "$TUNNEL_BY_HAND" ] && [ -n "$FW_KEPT" ]; then
+    warn "Tunnel: cloudflared is here, set up by hand, so 80 and 443 are left as they are. Re-run and answer y to the tunnel question to make this a tunnel-only server."
+else
+    # Allow common web ports (comment out if not needed)
+    ufw allow 80/tcp > /dev/null 2>&1
+    ufw allow 443/tcp > /dev/null 2>&1
+fi
 
 # Enable firewall
 ufw --force enable > /dev/null 2>&1
 
-ok "Firewall: 22 (rate-limited), 80, 443 open${FW_KEPT:-, everything else closed}"
+# What the firewall says now. The Docker rules below follow it.
+FW_STATUS_NOW=$(ufw status 2> /dev/null || true)
+WEB_OPEN=""
+if echo "$FW_STATUS_NOW" | grep -qE '^(80|443)/tcp +ALLOW'; then
+    WEB_OPEN=1
+fi
+
+if [ -n "$TUNNEL_ONLY" ]; then
+    ok "Firewall: only 22 (rate-limited) open. 80 and 443 closed, sites come in through the tunnel"
+    # Rules of your own that let something else in
+    ALSO_OPEN=$(echo "$FW_STATUS_NOW" | awk '/ ALLOW / && !/\(v6\)/ && !/ALLOW (OUT|FWD)/ {gsub(/ +/, " "); print}' | paste -sd';' - | sed 's/;/; /g')
+    if [ -n "$ALSO_OPEN" ]; then
+        warn "Firewall: also open, by rules of your own: $ALSO_OPEN. Each open port can give the IP away. Close: ufw delete allow <port>"
+    fi
+elif [ -n "$WEB_OPEN" ]; then
+    WEB_PORTS=$(echo "$FW_STATUS_NOW" | sed -nE 's#^(80|443)/tcp +ALLOW.*#\1#p' | sort -un | paste -sd, - | sed 's/,/, /g')
+    ok "Firewall: 22 (rate-limited), $WEB_PORTS open${FW_KEPT:-, everything else closed}"
+else
+    ok "Firewall: 22 (rate-limited) open, 80 and 443 left closed${FW_KEPT}"
+fi
 
 # -------------------------------------------------------------------------
 # Stop Docker from bypassing the firewall
@@ -596,7 +846,8 @@ if grep -q '^# BEGIN UFW AND DOCKER$' /etc/ufw/after.rules; then
     sed -i '/^# BEGIN UFW AND DOCKER$/,/^# END UFW AND DOCKER$/d' /etc/ufw/after.rules
 fi
 
-cat >> /etc/ufw/after.rules << 'EOF'
+{
+cat << 'EOF'
 # BEGIN UFW AND DOCKER
 *filter
 :ufw-user-forward - [0:0]
@@ -604,6 +855,16 @@ cat >> /etc/ufw/after.rules << 'EOF'
 :DOCKER-USER - [0:0]
 -A DOCKER-USER -j ufw-user-forward
 
+EOF
+if [ -n "$TUNNEL_ONLY" ]; then
+cat << 'EOF'
+# Tunnel-only server: no container delivers mail itself (port 25). Mail a
+# server sends directly carries the server's IP in its headers.
+-A DOCKER-USER -p tcp -m tcp --dport 25 -j REJECT --reject-with icmp-port-unreachable
+
+EOF
+fi
+cat << 'EOF'
 # Established/related traffic and container-to-container stay untouched
 -A DOCKER-USER -j RETURN -s 10.0.0.0/8
 -A DOCKER-USER -j RETURN -s 172.16.0.0/12
@@ -612,6 +873,10 @@ cat >> /etc/ufw/after.rules << 'EOF'
 # Container DNS replies
 -A DOCKER-USER -p udp -m udp --sport 53 --dport 1024:65535 -j RETURN
 
+EOF
+# Only where the firewall has 80/443 open at all - not on a tunnel-only server
+if [ -n "$WEB_OPEN" ]; then
+cat << 'EOF'
 # Ports 80 and 443 of the server reach whichever container publishes them: a
 # containerised reverse proxy (kamal-proxy, Traefik, Caddy in Docker). Matched
 # on the port the client connected to, before Docker's NAT swapped in the
@@ -619,6 +884,9 @@ cat >> /etc/ufw/after.rules << 'EOF'
 -A DOCKER-USER -p tcp -m conntrack --ctorigdstport 80 --ctdir ORIGINAL -j RETURN
 -A DOCKER-USER -p tcp -m conntrack --ctorigdstport 443 --ctdir ORIGINAL -j RETURN
 
+EOF
+fi
+cat << 'EOF'
 # Anything from outside aimed at a container gets dropped unless a ufw rule
 # allowed it. Published ports are no longer world-open by default.
 -A DOCKER-USER -j ufw-docker-logging-deny -p tcp -m tcp --tcp-flags FIN,SYN,RST,ACK SYN -d 192.168.0.0/16
@@ -636,6 +904,7 @@ cat >> /etc/ufw/after.rules << 'EOF'
 COMMIT
 # END UFW AND DOCKER
 EOF
+} >> /etc/ufw/after.rules
 
 # Earlier versions of this script opened 80/443 with `ufw route allow`. That
 # matches the port *inside* the container, so `-p 8080:80` was reachable from
@@ -644,7 +913,11 @@ ufw route delete allow proto tcp from any to any port 80 > /dev/null 2>&1 || tru
 ufw route delete allow proto tcp from any to any port 443 > /dev/null 2>&1 || true
 
 if ufw reload > /dev/null 2>&1; then
-    ok "Docker: containers reachable from outside on 80 and 443 only"
+    if [ -n "$WEB_OPEN" ]; then
+        ok "Docker: containers reachable from outside on 80 and 443 only"
+    else
+        ok "Docker: containers not reachable from outside, whatever ports they publish"
+    fi
 else
     cp "$AFTER_RULES_BACKUP" /etc/ufw/after.rules
     ufw reload > /dev/null 2>&1 || true
@@ -877,6 +1150,17 @@ APT::Periodic::Update-Package-Lists "1";
 APT::Periodic::Unattended-Upgrade "1";
 APT::Periodic::AutocleanInterval "7";
 EOF
+
+# cloudflared comes from Cloudflare's repo, and unattended-upgrades only takes
+# the distro's own packages unless told otherwise. A new version is used from
+# the next restart of the tunnel (or reboot) on.
+if [ -f /etc/apt/sources.list.d/cloudflared.list ]; then
+    cat > /etc/apt/apt.conf.d/53unattended-upgrades-serverus-sshnape-cloudflared << 'EOF'
+Unattended-Upgrade::Origins-Pattern {
+    "origin=cloudflared";
+};
+EOF
+fi
 
 # Don't leave an old image unpatched until tonight's timer: do that run now.
 # Only what it would install anyway. Not `apt-get upgrade`: on a re-run that
@@ -1188,6 +1472,16 @@ brief() {
     local CLOCK="synced"
     [ "$(timedatectl show -p NTPSynchronized --value 2>/dev/null)" = "yes" ] || { CLOCK="not synced"; WARN+=("Clock is not synced"); }
 
+    # Tunnel-only server: the tunnel is how visitors get in, and 80/443 stay shut
+    local TUNNEL=""
+    if [ -f /etc/serverus-sshnape/tunnel-only ]; then
+        TUNNEL=" · tunnel $(/usr/local/lib/serverus-sshnape/tunnel-state)"
+        [ "$TUNNEL" = " · tunnel up" ] || WARN+=("Cloudflare Tunnel is down - your sites are unreachable")
+        if ufw status 2>/dev/null | grep -qE '^(80|443)(/tcp)? +ALLOW'; then
+            WARN+=("Port 80 or 443 is open in the firewall - this server is meant to be reachable through the tunnel only")
+        fi
+    fi
+
     # Informational - logins are counted, not judged
     local LOGIN_COUNT LOGIN_IPS
     LOGIN_COUNT=$(ssh_log "$DAY" | grep -cE 'Accepted [a-z-]+ for ')
@@ -1219,7 +1513,7 @@ brief() {
         if (addr !~ /^127\./ && addr != "[::1]") print $1 "/" port
     }' | sort -t/ -k2 -n -u | paste -sd, - | sed 's/,/, /g')"
     echo "💾 Disk ${DISK}% · $MEM"
-    echo "🛡 Firewall $FIREWALL · fail2ban $F2B · clock $CLOCK"
+    echo "🛡 Firewall $FIREWALL · fail2ban $F2B · clock $CLOCK$TUNNEL"
     echo "⏱ $(uptime -p 2>/dev/null) · $REBOOT"
 }
 
@@ -1354,6 +1648,33 @@ OTHERS=$(awk -F: '$3 >= 1000 && $3 < 65000 && $7 !~ /(nologin|false)$/ {print $1
     done | paste -sd, - | sed 's/,/, /g')
 if [ -n "$OTHERS" ]; then
     warn "Can also log in with an SSH key: $OTHERS. Not yours? Empty their ~/.ssh/authorized_keys"
+fi
+
+# -------------------------------------------------------------------------
+# Tunnel-only: is anything else set up to answer the internet?
+# -------------------------------------------------------------------------
+# cloudflared reaches your web server on 127.0.0.1, so nothing but SSH needs
+# to listen on a public address. Whatever does is one firewall rule away from
+# showing the world what runs on this IP.
+if [ -n "$TUNNEL_ONLY" ]; then
+    LISTENING=$(ss -Hltnp 2> /dev/null | awk '{
+        n = split($4, a, ":"); port = a[n]; addr = substr($4, 1, length($4) - length(port) - 1)
+        if (addr ~ /^127\./ || addr == "[::1]" || port == 22) next
+        prog = "?"
+        if (match($0, /\(\("[^"]+"/)) prog = substr($0, RSTART + 3, RLENGTH - 4)
+        print port " (" prog ")"
+    }' | sort -un | paste -sd, - | sed 's/,/, /g')
+    if [ -n "$LISTENING" ]; then
+        warn "Listening on every address instead of 127.0.0.1: $LISTENING. Only the firewall keeps these private. Bind them to 127.0.0.1"
+    fi
+
+    if command -v docker > /dev/null 2>&1; then
+        PUBLISHED=$(docker ps --format '{{.Names}} {{.Ports}}' 2> /dev/null < /dev/null | \
+            awk '$0 ~ /(0\.0\.0\.0|\[::\]|::):[0-9]/ {print $1}' | sort -u | paste -sd, - | sed 's/,/, /g')
+        if [ -n "$PUBLISHED" ]; then
+            warn "Containers publishing ports on every address: $PUBLISHED. Write them as \"127.0.0.1:PORT:PORT\""
+        fi
+    fi
 fi
 
 # -------------------------------------------------------------------------
@@ -1494,6 +1815,20 @@ if [ -f "$PORTS" ]; then
     fi
 else
     echo "$CURRENT" > "$PORTS"
+fi
+
+# Tunnel-only server: the tunnel is how visitors get in. Down on two checks in
+# a row alerts once (a restart is over by then), and so does coming back.
+if [ -f /etc/serverus-sshnape/tunnel-only ]; then
+    if [ "$(/usr/local/lib/serverus-sshnape/tunnel-state)" = up ]; then
+        [ -f "$STATE/tunnel-alerted" ] && MSG+=$'\n\n'"☁️ Cloudflare Tunnel is connected again"
+        rm -f "$STATE/tunnel-down" "$STATE/tunnel-alerted"
+    elif [ ! -f "$STATE/tunnel-down" ]; then
+        touch "$STATE/tunnel-down"
+    elif [ ! -f "$STATE/tunnel-alerted" ]; then
+        MSG+=$'\n\n'"☁️ Cloudflare Tunnel is down - your sites are unreachable"$'\n'"Look: journalctl -u cloudflared -n 30"
+        touch "$STATE/tunnel-alerted"
+    fi
 fi
 
 # Monday morning check-in, so silence can't be mistaken for "all good"
@@ -1761,11 +2096,17 @@ STATUS_OUT=$(ssh -i "$KEY_PATH" "${SSH_MUX[@]}" -o ConnectTimeout=10 "root@$SERV
     echo "FW=${FW:-unknown}"
     echo "F2B=$(systemctl is-active fail2ban 2>/dev/null || echo unknown)"
     echo "FAILED=$(systemctl --failed --no-legend --plain 2>/dev/null | awk "{print \$1}" | paste -sd, -)"
+    if [ -f /etc/serverus-sshnape/tunnel-only ]; then
+        echo "TUNNEL=$(/usr/local/lib/serverus-sshnape/tunnel-state)"
+    else
+        echo "TUNNEL=off"
+    fi
 ' 2>/dev/null)
 
 FW_STATUS=$(echo "$STATUS_OUT" | sed -n 's/^FW=//p')
 F2B_STATUS=$(echo "$STATUS_OUT" | sed -n 's/^F2B=//p')
 FAILED_UNITS=$(echo "$STATUS_OUT" | sed -n 's/^FAILED=//p')
+TUNNEL_STATUS=$(echo "$STATUS_OUT" | sed -n 's/^TUNNEL=//p')
 
 if [ "$FW_STATUS" = "active" ]; then
     print_success "Firewall: active"
@@ -1780,6 +2121,43 @@ if [ "$F2B_STATUS" = "active" ]; then
     print_success "Fail2ban: active"
 else
     print_warning "Fail2ban: ${F2B_STATUS:-unknown}"
+fi
+
+# Tunnel-only server: the tunnel has to be up, and from out here 80 and 443
+# must not answer. A timeout or a refusal is what closed looks like; anything
+# else means something on that port talks to the whole internet.
+case "$TUNNEL_STATUS" in
+    up)
+        print_success "Tunnel: connected to Cloudflare"
+        ;;
+    down)
+        print_error "Tunnel: not connected. On the server: journalctl -u cloudflared -n 30"
+        FINAL_FAILED=1
+        ;;
+    *)
+        if [ -n "$CF_TOKEN" ]; then
+            print_error "Tunnel: not set up, see the message above. Until it is, 80 and 443 are open as on a server without a tunnel. Run again with the token."
+            FINAL_FAILED=1
+        fi
+        ;;
+esac
+if [ "$TUNNEL_STATUS" = "up" ] || [ "$TUNNEL_STATUS" = "down" ]; then
+    PROBE_HOST="$SERVER"
+    [[ "$SERVER" == *:* ]] && PROBE_HOST="[$SERVER]"
+    STILL_OPEN=""
+    for port in 80 443; do
+        PORT_RC=0
+        curl -s -o /dev/null --connect-timeout 4 --max-time 5 "http://$PROBE_HOST:$port/" || PORT_RC=$?
+        if [ "$PORT_RC" -ne 7 ] && [ "$PORT_RC" -ne 28 ]; then
+            STILL_OPEN="$STILL_OPEN $port"
+        fi
+    done
+    if [ -z "$STILL_OPEN" ]; then
+        print_success "Ports 80 and 443 do not answer from the outside"
+    else
+        print_error "Answering from the internet on the server's own address: port$STILL_OPEN. That gives the IP away."
+        FINAL_FAILED=1
+    fi
 fi
 
 # Nothing this script does fails a unit, so these were broken before we came.
@@ -1797,10 +2175,43 @@ echo "Connect:      ssh root@$SERVER"
 echo "Key:          $KEY_PATH"
 echo "On server:    security-check · fail2ban-client status sshd · aureport --login"
 [ -n "$TELEGRAM" ] && echo "Telegram:     /status any time · send-alert \"text\" from your own jobs"
+[ "$TUNNEL_STATUS" = "up" ] && echo "Tunnel:       systemctl status cloudflared · journalctl -u cloudflared"
 echo ""
 echo "1. Back up the key now. It is the only way in; the root password is locked."
 echo "   Password managers store SSH keys (1Password, Bitwarden). Lost it: provider's rescue mode."
 echo "2. Add an outside uptime check. A dead server can't text you."
-echo "3. Publish container ports on 127.0.0.1 behind a reverse proxy. Only 80/443 are open."
+if [ "$TUNNEL_STATUS" = "up" ] || [ "$TUNNEL_STATUS" = "down" ]; then
+    echo "3. Publish container ports on 127.0.0.1 only. Nothing but SSH is open."
+    echo ""
+    echo -e "${BOLD}Behind the tunnel: keep this server's IP secret${NC}"
+    echo "One place that shows the IP undoes all the others, and it can't be taken back."
+    echo "The only fix after a leak is a new IP."
+    echo "  Sites    Every hostname is a route of the tunnel (Cloudflare: Networking > Tunnels >"
+    echo "           your tunnel), pointing at http://127.0.0.1:80. Your web server listens"
+    echo "           there in plain HTTP; Cloudflare does the HTTPS."
+    echo "  DNS      Never a record with this IP: no A, AAAA, wildcard or MX, not as DNS-only,"
+    echo "           not for ssh. or dev., not for five minutes - DNS history sites keep it"
+    echo "           forever. No reverse DNS (PTR) with your domain either. IPv6 counts too."
+    echo "  Ports    Never open 80 or 443, not even to get a certificate. Bind every service"
+    echo "           to 127.0.0.1; in Docker write \"127.0.0.1:PORT:PORT\". No other public"
+    echo "           service on this server: no mail, game, VPN or FTP server."
+    echo "  Mail     Send through a mail API (Resend, Brevo, ...). Mail the server delivers"
+    echo "           itself shows its IP in the headers, so outgoing port 25 is blocked."
+    echo "  Fetches  When the server fetches a URL someone else chose (webhooks, link previews,"
+    echo "           importing a file or feed from a URL), that someone sees the IP. Send"
+    echo "           those through a relay, like a Cloudflare Worker."
+    echo "  You      Keep the IP out of code, docs, commits, issues and screenshots. SSH by"
+    echo "           IP from ~/.ssh/config; point uptime checks at the domain."
+    echo "  Check    Now and then look the IP up on search.censys.io and shodan.io:"
+    echo "           SSH only, and no domain name next to it."
+    if [[ "$SERVER" =~ [A-Za-z] ]] && [[ "$SERVER" != *:* ]]; then
+        echo ""
+        print_warning "You connected to $SERVER by name, so a DNS record points at this server."
+        echo "  That record is public. Delete it, use the IP for SSH - and if it named this"
+        echo "  IP for long, treat the IP as known."
+    fi
+else
+    echo "3. Publish container ports on 127.0.0.1 behind a reverse proxy. Only 80/443 are open."
+fi
 
 [ -z "${FINAL_FAILED:-}" ] || exit 1

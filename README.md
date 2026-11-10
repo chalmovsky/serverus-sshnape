@@ -34,6 +34,7 @@ You type the root password once. That's the last time you'll ever need it.
 - On Ubuntu: takes the Ubuntu Pro and ESM ads out of the login message, keeps the update count
 - Installs `security-check`: tells you "✅ All good" or what needs a look, then the details
 - Adds the key to your `~/.ssh/config`
+- Optional: puts the server behind a Cloudflare Tunnel, with 80 and 443 closed ([below](#behind-a-cloudflare-tunnel))
 
 Then connect with:
 
@@ -82,6 +83,61 @@ send-alert "backup failed"
 
 A dead server can't text you, so use an outside uptime check for that.
 
+## Behind a Cloudflare Tunnel
+
+The script asks if you want a tunnel. Say yes and visitors reach your sites through Cloudflare instead of connecting to the server: free DDoS protection, and the server's IP appears in no DNS record. It works on Cloudflare's free plan.
+
+You need a Cloudflare account with your domain on it. In the dashboard go to Networking > Tunnels, create a tunnel (type Cloudflared) and copy the token from the install command it shows. Paste it when the script asks; don't run that command yourself. Then the script:
+
+- Installs `cloudflared` from Cloudflare's apt repo, kept up to date with the other automatic updates
+- Runs it as a service under its own account with no privileges. The token sits in a file only root and that service can read, never in a command line
+- Closes 80 and 443 once the tunnel is connected. Only SSH stays open, on IPv4 and IPv6. A token that doesn't connect is undone and closes nothing
+- Makes containers unreachable from outside, whatever ports they publish
+- Blocks outgoing port 25, for the server and its containers: mail a server delivers itself shows its IP
+- Warns about anything listening on a public address and containers publishing ports without `127.0.0.1`
+- Checks from your machine that 80 and 443 don't answer
+- With Telegram alerts on: texts you when the tunnel goes down and when it's back, and shows it in `/status`
+
+Then, in the tunnel's page, add a route for each hostname pointing at `http://127.0.0.1:80`. Your web server listens there in plain HTTP and Cloudflare does the HTTPS. With Caddy that means `http://example.com { ... }` site blocks and `default_bind 127.0.0.1`.
+
+The server remembers it is tunnel-only: re-running the script keeps 80 and 443 closed. To add a tunnel later, or swap the token, re-run and say yes. To go back: `rm /etc/serverus-sshnape/tunnel-only`, `systemctl disable --now cloudflared`, `ufw delete reject out 25/tcp`, and re-run.
+
+### Keeping the IP secret
+
+The tunnel only protects you while nobody knows the server's IP. One place that shows it undoes all the others, and you can't take it back: the only fix after a leak is a new IP.
+
+**DNS**
+
+- Never point a record at the server. No `A` or `AAAA`, not as "DNS only", not for a minute, not for a harmless-looking `ssh.` or `dev.`. Every hostname is a tunnel route.
+- No wildcard records, no `MX` to the server, and never its IP in an SPF record.
+- No reverse DNS (PTR) with your domain on the IP.
+- Deleted records stay public. DNS history sites keep a record that existed for five minutes forever.
+
+**The server answering the internet**
+
+- Never open 80 or 443, not even to get a certificate. Scanners sweep every IP, read the page or certificate, and tie your domain to the IP within hours.
+- Bind every service to `127.0.0.1`, never `0.0.0.0`. In Docker: `"127.0.0.1:PORT:PORT"`.
+- No other public service on the same server: no mail, game, VPN or FTP server.
+- All sites on the server go through the tunnel, or none. One site outside it exposes the rest.
+
+**The server calling out**
+
+When the server fetches a URL someone else chose, that someone sees its IP: webhooks, link previews, "import from URL", avatar URLs, RSS and calendar imports, rendering user HTML to PDF. Send those through a relay, such as a small Cloudflare Worker. Calls to services you picked yourself (a mail API, a payment provider, object storage) are fine.
+
+**Mail**
+
+Send through a mail API (Resend, Brevo, ...), never from the server, and don't run a mail server on it.
+
+**Your own content**
+
+- Keep the IP out of code, docs, commits, issues and screenshots, private repos included. It belongs in `~/.ssh/config` and gitignored env files; use a placeholder like `203.0.113.10` elsewhere.
+- No error or debug pages that print server details, no `X-Backend` or `Via` headers.
+- SSH to the IP, never to a domain. Point uptime checks at the domain, never the IP.
+
+**IPv6 counts too.** The server has an IPv6 address and every rule applies to it.
+
+**Now and then**, look the IP up on search.censys.io and shodan.io: it should show SSH only, with no domain next to it. If it leaks anyway, get a new IP (IPv4 and IPv6), then find and close what leaked it.
+
 ## Running containers
 
 Bind to localhost and put a reverse proxy in front:
@@ -90,6 +146,8 @@ Bind to localhost and put a reverse proxy in front:
 ports:
   - "127.0.0.1:3000:3000"
 ```
+
+Without a tunnel, the reverse proxy is the one thing that answers on 80 and 443. Behind a tunnel the reverse proxy binds to `127.0.0.1:80` as well, and nothing answers publicly.
 
 ## Lost your key
 
