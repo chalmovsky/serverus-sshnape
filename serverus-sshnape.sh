@@ -1661,6 +1661,18 @@ for service in $SERVICES_TO_DISABLE; do
     fi
 done
 
+# systemd-resolved also answers LLMNR and mDNS, on every address (ports 5355
+# and 5353). Those find machines by name on a home or office network; a server
+# has no use for them. Ordinary DNS lookups are not affected.
+if systemctl is-active --quiet systemd-resolved 2> /dev/null; then
+    RESOLVED_CONF=/etc/systemd/resolved.conf.d/90-serverus-sshnape.conf
+    if ! printf '[Resolve]\nLLMNR=no\nMulticastDNS=no\n' | cmp -s - "$RESOLVED_CONF" 2> /dev/null; then
+        mkdir -p /etc/systemd/resolved.conf.d
+        printf '[Resolve]\nLLMNR=no\nMulticastDNS=no\n' > "$RESOLVED_CONF"
+        systemctl restart systemd-resolved > /dev/null 2>&1 || true
+    fi
+fi
+
 # -------------------------------------------------------------------------
 # Quiet login message
 # -------------------------------------------------------------------------
