@@ -1463,6 +1463,39 @@ ausearch --input-logs -k "$KEY" \
 EOF
 chmod 755 /usr/local/lib/serverus-sshnape/audit-changes
 
+# auditd records every write to /etc/ssh, also one that leaves the file as it
+# was: some providers run `sed -i` on sshd_config at every boot. Comparing two
+# of these tells a real change from a rewrite.
+cat > /usr/local/lib/serverus-sshnape/ssh-config-sum << 'EOF'
+#!/bin/bash
+# Prints the state of /etc/ssh: a content hash for every file, then
+# permissions and owner for everything. Same output twice = nothing changed.
+# LC_ALL=C: the order must not depend on who runs it.
+{
+    find /etc/ssh -type f -exec sha256sum {} +
+    find /etc/ssh -exec stat -c '%a %U:%G %N' {} +
+} 2>/dev/null | LC_ALL=C sort
+EOF
+chmod 755 /usr/local/lib/serverus-sshnape/ssh-config-sum
+
+cat > /usr/local/lib/serverus-sshnape/listening << 'EOF'
+#!/bin/bash
+# Prints what listens on a reachable address, one per line: tcp/22, udp/123.
+# Skipped: loopback-only listeners, and the UDP sockets of the Cloudflare
+# Tunnel. cloudflared talks to Cloudflare from four of them, on random ports
+# that are new at every restart, and nothing connects to them from outside.
+# Told apart by the service's process id, not by name: anything can call
+# itself cloudflared.
+CF_PID=$(systemctl show -p MainPID --value cloudflared 2>/dev/null)
+[[ "$CF_PID" =~ ^[0-9]+$ ]] || CF_PID=0
+ss -Hltunp 2>/dev/null | awk -v cf="$CF_PID" '{
+    if (cf > 0 && $1 == "udp" && index($0, "pid=" cf ",")) next
+    n = split($5, a, ":"); port = a[n]; addr = substr($5, 1, length($5) - length(port) - 1)
+    if (addr !~ /^127\./ && addr != "[::1]") print $1 "/" port
+}' | sort -u
+EOF
+chmod 755 /usr/local/lib/serverus-sshnape/listening
+
 cat > /usr/local/bin/security-check << 'SECSCRIPT'
 #!/bin/bash
 # =============================================================================
@@ -1492,12 +1525,21 @@ brief() {
 
     # Changes to who can get in - always worth a look, even when it was you
     local ENTRY KEY LABEL CHANGES FILES BY
+    local SSH_SUM=/var/lib/serverus-sshnape/ssh-config.sum SSH_SUM_NOW
     for ENTRY in "authorized_keys:SSH login keys" "ssh_config:SSH server config" "sudoers:sudo rules" \
                  "identity:Users, groups or passwords" "cron:Scheduled jobs (cron)"; do
         KEY=${ENTRY%%:*}
         LABEL=${ENTRY#*:}
         CHANGES=$(/usr/local/lib/serverus-sshnape/audit-changes "$KEY" "$SINCE" "$(date +%s)")
         [ -n "$CHANGES" ] || continue
+        # Written to, but nothing in /etc/ssh differs from the state saved
+        # before this window began: a rewrite, like the `sed -i` some
+        # providers run on sshd_config at every boot. The saved state is from
+        # setup or from the last real change (its file's date says when).
+        if [ "$KEY" = ssh_config ] && [ -f "$SSH_SUM" ] && [ "$(stat -c %Y "$SSH_SUM")" -lt "$SINCE" ]; then
+            SSH_SUM_NOW=$(/usr/local/lib/serverus-sshnape/ssh-config-sum)
+            [ -n "$SSH_SUM_NOW" ] && [ "$SSH_SUM_NOW" = "$(cat "$SSH_SUM")" ] && continue
+        fi
         FILES=$(echo "$CHANGES" | cut -f1 | grep -vx -- - | sort -u | head -3 | paste -sd, - | sed 's/,/, /g')
         BY=$(echo "$CHANGES" | awk -F'\t' '{print $2 ($3 != "-" ? " using " $3 : "")}' | sort -u | paste -sd';' - | sed 's/;/; /g')
         WARN+=("$LABEL changed${FILES:+: $FILES} (by $BY)")
@@ -1564,10 +1606,7 @@ brief() {
     echo ""
     echo "Logins (24h): $LOGIN_COUNT from $LOGIN_IPS IPs"
     echo "Failed SSH attempts (24h): $FAIL_COUNT from $FAIL_IPS IPs · ${BANNED:-0} banned now"
-    echo "Open ports: $(ss -Hltun 2>/dev/null | awk '{
-        n = split($5, a, ":"); port = a[n]; addr = substr($5, 1, length($5) - length(port) - 1)
-        if (addr !~ /^127\./ && addr != "[::1]") print $1 "/" port
-    }' | sort -t/ -k2 -n -u | paste -sd, - | sed 's/,/, /g')"
+    echo "Open ports: $(/usr/local/lib/serverus-sshnape/listening | sort -t/ -k2 -n -u | paste -sd, - | sed 's/,/, /g')"
     echo "Disk ${DISK}% · $MEM"
     echo "Firewall $FIREWALL · fail2ban $F2B · clock $CLOCK$TUNNEL"
     echo "$(uptime -p 2>/dev/null) · $REBOOT"
@@ -1745,6 +1784,11 @@ if [ -n "$TUNNEL_ONLY" ]; then
     fi
 fi
 
+# /etc/ssh as this run leaves it. A later write to it only counts as a change
+# when the result differs from this.
+mkdir -p /var/lib/serverus-sshnape
+/usr/local/lib/serverus-sshnape/ssh-config-sum > /var/lib/serverus-sshnape/ssh-config.sum
+
 # -------------------------------------------------------------------------
 # Telegram alerts
 # -------------------------------------------------------------------------
@@ -1839,6 +1883,16 @@ if [ -n "$AUDIT_FROM" ] && [ "$AUDIT_FROM" -lt "$AUDIT_TO" ]; then
     for KEY in authorized_keys ssh_config sudoers identity cron; do
         CHANGES=$(/usr/local/lib/serverus-sshnape/audit-changes "$KEY" "$AUDIT_FROM" "$AUDIT_TO")
         [ -n "$CHANGES" ] || continue
+        if [ "$KEY" = ssh_config ]; then
+            # Written to, but is anything different? Some providers run
+            # `sed -i` on sshd_config at every boot, which rewrites it as it
+            # was. Only a /etc/ssh that differs from the last known one alerts.
+            SSH_SUM=$(/usr/local/lib/serverus-sshnape/ssh-config-sum)
+            if [ -n "$SSH_SUM" ]; then
+                [ "$SSH_SUM" = "$(cat "$STATE/ssh-config.sum" 2>/dev/null)" ] && continue
+                echo "$SSH_SUM" > "$STATE/ssh-config.sum"
+            fi
+        fi
         FILES=$(echo "$CHANGES" | cut -f1 | grep -vx -- - | sort -u)
         BY=$(echo "$CHANGES" | awk -F'\t' '{print $2 ($3 != "-" ? " using " $3 : "")}' | sort -u | paste -sd';' - | sed 's/;/; /g')
         case $KEY in
@@ -1874,13 +1928,10 @@ if [ -n "$SINCE" ] && [ "$SINCE" -lt "$NOW" ]; then
 fi
 
 # Something new listening on a reachable address - your new app, or not.
-# Loopback-only listeners are skipped. The baseline only grows, so a service
-# that restarts doesn't re-alert.
+# Loopback-only listeners and the tunnel's own UDP sockets are skipped. The
+# baseline only grows, so a service that restarts doesn't re-alert.
 PORTS="$STATE/listen-ports"
-CURRENT=$(ss -Hltun 2>/dev/null | awk '{
-    n = split($5, a, ":"); port = a[n]; addr = substr($5, 1, length($5) - length(port) - 1)
-    if (addr !~ /^127\./ && addr != "[::1]") print $1 "/" port
-}' | sort -u)
+CURRENT=$(/usr/local/lib/serverus-sshnape/listening)
 if [ -f "$PORTS" ]; then
     NEW=$(comm -13 "$PORTS" <(echo "$CURRENT") | paste -sd, - | sed 's/,/, /g')
     if [ -n "$NEW" ]; then
@@ -1929,7 +1980,7 @@ PENDING="$STATE/pending"
 [ -s "$PENDING" ] && MSG="$(cat "$PENDING")$MSG"
 [ -n "$MSG" ] || exit 0
 MSG=${MSG:0:3500}
-if /usr/local/bin/send-alert "🚨 Needs a look$MSG"; then
+if /usr/local/bin/send-alert "Needs a look$MSG"; then
     rm -f "$PENDING"
 else
     printf '%s' "$MSG" > "$PENDING"
@@ -2237,10 +2288,7 @@ EOF
     rm -f /var/lib/serverus-sshnape/pending
 
     # Today's listeners are the baseline - only ports that appear later alert
-    ss -Hltun 2>/dev/null | awk '{
-        n = split($5, a, ":"); port = a[n]; addr = substr($5, 1, length($5) - length(port) - 1)
-        if (addr !~ /^127\./ && addr != "[::1]") print $1 "/" port
-    }' | sort -u > /var/lib/serverus-sshnape/listen-ports
+    /usr/local/lib/serverus-sshnape/listening > /var/lib/serverus-sshnape/listen-ports
 
     # The IP running this script is you - don't alert on its next login
     SETUP_IP="${SSH_CLIENT%% *}"
