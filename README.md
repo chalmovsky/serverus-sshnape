@@ -76,7 +76,7 @@ up 3 days, 2 hours · no reboot pending
 
 ### One bot for all your servers
 
-You need one bot, however many servers you have. The script remembers it on your machine, in `~/.config/serverus-sshnape/telegram`, readable only by you. On the next server it asks "Add this server to your bot?" and you press Enter. On another machine, paste the same token.
+You need one bot, however many servers you have. The script remembers it on your machine, in `~/.config/serverus-sshnape/telegram`, readable only by you. On the next server it asks "Add this server to your bot?" and you press Enter. On another machine, or for a bot you made earlier, paste its token: in @BotFather send `/mybots`, pick the bot and tap API Token.
 
 It also asks for a name for the server, like `web1`. Every alert starts with it and commands take it. Give each server a different one; leave it empty and the server's hostname is used.
 

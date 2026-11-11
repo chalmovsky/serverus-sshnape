@@ -168,7 +168,8 @@ if [ "$want_telegram" = "y" ] || [ "$want_telegram" = "Y" ]; then
 
     if [ -z "$BOT_NAME" ]; then
         echo "New bot: message @BotFather in Telegram, send /newbot, paste the token here."
-        echo "A bot you already have: paste its token. Servers share a bot without trouble."
+        echo "A bot you already have: in @BotFather send /mybots, pick the bot, tap API Token,"
+        echo "paste it here. Servers share a bot without trouble."
         # Hidden, so it stays out of the terminal scrollback
         read -rsp "Bot token: " TG_TOKEN
         echo ""
