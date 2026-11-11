@@ -32,7 +32,7 @@ You type the root password once. That's the last time you'll ever need it.
 - auditd watches the SSH keys of every account that can log in, plus users, sudoers, cron, systemd and PAM
 - Disables cups, avahi, rpcbind and nfs if present
 - On Ubuntu: takes the Ubuntu Pro and ESM ads out of the login message, keeps the update count
-- Installs `security-check`: tells you "✅ All good" or what needs a look, then the details
+- Installs `security-check`: tells you "All good" or what needs a look, then the details
 - Adds the key to your `~/.ssh/config`
 - Optional: puts the server behind a Cloudflare Tunnel, with 80 and 443 closed ([below](#behind-a-cloudflare-tunnel))
 
@@ -58,22 +58,43 @@ The script asks if you want alerts. Say yes and the server texts you when someth
 - Server rebooted
 - Every Monday morning, a short check-in, so silence never means "the bot died"
 
-It walks you through it: create a bot with @BotFather, paste the token, send the bot a message, and it says hello back. Free. Use a separate bot for each server. You can add it later too: re-run the script on a hardened server and say yes.
+It walks you through it: create a bot with @BotFather, paste the token, send the bot a message, and it says hello back. Free. You can add it later too: re-run the script on a hardened server and say yes.
 
 Send `/status` to the bot any time and it answers with the health check:
 
 ```
-✅ All good
+[web1]
+All good
 
-🔑 Logins (24h): 3 from 1 IPs
-🚫 Failed SSH attempts (24h): 212 from 48 IPs · 5 banned now
-🌐 Open ports: tcp/22, tcp/80, tcp/443
-💾 Disk 34% · RAM 1.1Gi/1.9Gi · swap 0B/1.0Gi
-🛡 Firewall on · fail2ban on · clock synced
-⏱ up 3 days, 2 hours · no reboot pending
+Logins (24h): 3 from 1 IPs
+Failed SSH attempts (24h): 212 from 48 IPs · 5 banned now
+Open ports: tcp/22, tcp/80, tcp/443
+Disk 34% · RAM 1.1Gi/1.9Gi · swap 0B/1.0Gi
+Firewall on · fail2ban on · clock synced
+up 3 days, 2 hours · no reboot pending
 ```
 
-It only answers you, and only runs that one read-only check.
+### One bot for all your servers
+
+You need one bot, however many servers you have. The script remembers it on your machine, in `~/.config/serverus-sshnape/telegram`, readable only by you. On the next server it asks "Add this server to your bot?" and you press Enter. On another machine, paste the same token.
+
+It also asks for a name for the server, like `web1`. Every alert starts with it and commands take it. Give each server a different one; leave it empty and the server's hostname is used.
+
+| Send | What happens |
+| --- | --- |
+| `/servers` | Every server answers with one line: its name, how it's doing, how long it's been up |
+| `/status` | Every server answers with its health check. `/status web1` asks just one |
+| `/reboot web1` | Reboots that server. It texts you when it's back |
+| `/shutdown web1 yes` | Powers that server off. It stays off until you start it in your provider's panel |
+| `/remove web1` | Takes that server off the bot: no more alerts from it, and it forgets the bot's token |
+
+To add a server, run the script on it and say yes to Telegram. To put a removed one back, do the same. A server you deleted at your provider needs no removing: it just stops answering.
+
+No answer to a command? Check the name with `/servers`. A reboot, shutdown or removal only happens on the server whose name you typed, never on all of them.
+
+The bot only listens to your chat, and nothing you type is run as a command: each word above maps to one fixed action. Still, whoever gets into your Telegram account can now reboot or shut down your servers, so turn on two-step verification in Telegram.
+
+Servers set up with an older version of this script take the bot's messages for themselves. Run the script on them once more, then they share.
 
 Your own jobs can text you too:
 

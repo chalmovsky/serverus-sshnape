@@ -20,7 +20,8 @@
 #      rebooting at 04:00 UTC when needed
 #  12. Configure security auditing
 #  13. Lock root password
-#  14. Send critical alerts to Telegram, if you say yes when asked
+#  14. Send critical alerts to Telegram, if you say yes when asked. One bot
+#      serves all your servers: /status, /servers, /reboot, /shutdown, /remove
 #  15. Put the server behind a Cloudflare Tunnel, if you say yes when asked:
 #      80 and 443 closed, sites reachable through Cloudflare only
 # =============================================================================
@@ -121,58 +122,105 @@ chmod 700 "$HOME/.ssh"
 TELEGRAM=""
 TG_TOKEN=""
 TG_CHAT=""
+TG_NAME=""
+# One bot serves all your servers. It is remembered on this machine, so the
+# next server takes one keypress instead of a trip to BotFather.
+TG_SAVED="$HOME/.config/serverus-sshnape/telegram"
+
+# The token reaches curl on stdin, not in its arguments, where `ps` shows it
+tg_api() {
+    local method="$1"
+    shift
+    curl -s --max-time 10 "$@" -K - <<< "url = \"https://api.telegram.org/bot$TG_TOKEN/$method\""
+}
+
+tg_bot_name() {
+    tg_api getMe | grep -oE '"username":"[^"]+"' | head -1 | cut -d'"' -f4
+}
+
 echo "Telegram alerts: logins from new IPs, changed SSH keys/users/cron, new open ports,"
 echo "full disk, OOM kills, reboots. /status answers with a health check. Free."
+echo "One bot is enough for all your servers."
 read -rp "Set up Telegram alerts? (y/n) [n]: " want_telegram
 if [ "$want_telegram" = "y" ] || [ "$want_telegram" = "Y" ]; then
     TELEGRAM=1
-    echo "Message @BotFather in Telegram, send /newbot, paste the token here. One bot per server."
-    # Hidden, so it stays out of the terminal scrollback
-    read -rsp "Bot token: " TG_TOKEN
-    echo ""
+    BOT_NAME=""
 
-    if ! [[ "$TG_TOKEN" =~ ^[0-9]+:[A-Za-z0-9_-]+$ ]]; then
-        print_error "Not a bot token (expected 123456789:ABC...)"
-        exit 1
+    # The bot from an earlier run, if it still works
+    if [ -r "$TG_SAVED" ]; then
+        { read -r TG_TOKEN; read -r TG_CHAT; } < "$TG_SAVED" || true
+        if [[ "$TG_TOKEN" =~ ^[0-9]+:[A-Za-z0-9_-]+$ ]] && [[ "$TG_CHAT" =~ ^-?[0-9]+$ ]]; then
+            BOT_NAME=$(tg_bot_name || true)
+        fi
+        if [ -n "$BOT_NAME" ]; then
+            read -rp "Add this server to your bot @$BOT_NAME? (y/n) [y]: " reuse_bot
+            if [ "$reuse_bot" = "n" ] || [ "$reuse_bot" = "N" ]; then
+                BOT_NAME=""
+            fi
+        else
+            print_warning "The bot remembered in $TG_SAVED did not answer. Setting one up again."
+        fi
+        if [ -z "$BOT_NAME" ]; then
+            TG_TOKEN=""
+            TG_CHAT=""
+        fi
     fi
 
-    # The token reaches curl on stdin, not in its arguments, where `ps` shows it
-    tg_api() {
-        local method="$1"
-        shift
-        curl -s --max-time 10 "$@" -K - <<< "url = \"https://api.telegram.org/bot$TG_TOKEN/$method\""
-    }
-
-    BOT_NAME=$(tg_api getMe | \
-        grep -oE '"username":"[^"]+"' | head -1 | cut -d'"' -f4)
     if [ -z "$BOT_NAME" ]; then
-        print_error "Telegram rejected the token"
-        exit 1
+        echo "New bot: message @BotFather in Telegram, send /newbot, paste the token here."
+        echo "A bot you already have: paste its token. Servers share a bot without trouble."
+        # Hidden, so it stays out of the terminal scrollback
+        read -rsp "Bot token: " TG_TOKEN
+        echo ""
+
+        if ! [[ "$TG_TOKEN" =~ ^[0-9]+:[A-Za-z0-9_-]+$ ]]; then
+            print_error "Not a bot token (expected 123456789:ABC...)"
+            exit 1
+        fi
+
+        BOT_NAME=$(tg_bot_name || true)
+        if [ -z "$BOT_NAME" ]; then
+            print_error "Telegram rejected the token"
+            exit 1
+        fi
+
+        # The bot can't message you until you've messaged it - and that first
+        # message is also how we learn your chat id.
+        echo "Now send any message to @$BOT_NAME (waiting up to 2 minutes)"
+        for _ in $(seq 1 60); do
+            TG_CHAT=$(tg_api getUpdates | \
+                grep -oE '"chat":\{"id":-?[0-9]+' | tail -1 | grep -oE -- '-?[0-9]+$' || true)
+            [ -n "$TG_CHAT" ] && break
+            sleep 2
+        done
+        if [ -z "$TG_CHAT" ]; then
+            print_error "No message arrived. Run again to retry."
+            echo "  A server set up with an older version of this script takes the bot's messages"
+            echo "  for itself. Run this script on that server once more (answer n to the"
+            echo "  questions), then it shares."
+            exit 1
+        fi
     fi
 
-    # The bot can't message you until you've messaged it - and that first
-    # message is also how we learn your chat id.
-    echo "Now send any message to @$BOT_NAME (waiting up to 2 minutes)"
-    for _ in $(seq 1 60); do
-        TG_CHAT=$(tg_api getUpdates | \
-            grep -oE '"chat":\{"id":-?[0-9]+' | tail -1 | grep -oE -- '-?[0-9]+$' || true)
-        [ -n "$TG_CHAT" ] && break
-        sleep 2
-    done
-    if [ -z "$TG_CHAT" ]; then
-        print_error "No message arrived. Run again to retry."
-        echo "  Another server using this bot grabs the message first: use one bot per server."
-        echo "  This server already running it: ssh root@$SERVER systemctl stop serverus-sshnape-bot"
-        exit 1
-    fi
-    # Reply right away: proves the bot can send, not just receive
+    # The name is how you tell servers apart: every alert starts with it, and
+    # commands take it (/status web1).
+    echo "Name for this server in Telegram, like web1. Alerts start with it, commands take it."
+    read -rp "Server name [Enter: the server's hostname, or the name it has now]: " TG_NAME
+    TG_NAME=$(printf '%s' "$TG_NAME" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9._-]+/-/g; s/^-+//; s/-+$//' | cut -c1-32)
+
+    # Proves the bot can send to this chat, not just receive
     if ! tg_api sendMessage -f -o /dev/null \
         --data-urlencode "chat_id=$TG_CHAT" \
-        --data-urlencode "text=👋 Hello! Alerts will arrive here. Setting up the server now, you'll get a message when it's done."; then
+        --data-urlencode "text=Hello! Setting up ${TG_NAME:-a server} now. Its alerts will arrive here, and you'll get a message when it's done."; then
         print_error "Could not send a message to this chat"
         exit 1
     fi
     print_success "Telegram: @$BOT_NAME said hello"
+
+    mkdir -p "$(dirname "$TG_SAVED")"
+    ( umask 077; printf '%s\n%s\n' "$TG_TOKEN" "$TG_CHAT" > "$TG_SAVED" )
+    chmod 600 "$TG_SAVED"
+    echo "  Bot remembered in ~${TG_SAVED#"$HOME"} (only you can read it) for your next server."
 fi
 
 # Asked up front as well. The token is hidden like Telegram's, and reaches the
@@ -380,7 +428,7 @@ print_step "Server"
 # command line, where `ps` on the server would show them.
 REMOTE_STATUS=0
 {
-    printf 'TG_TOKEN=%q\nTG_CHAT=%q\nCF_TOKEN=%q\n' "$TG_TOKEN" "$TG_CHAT" "$CF_TOKEN"
+    printf 'TG_TOKEN=%q\nTG_CHAT=%q\nTG_NAME=%q\nCF_TOKEN=%q\n' "$TG_TOKEN" "$TG_CHAT" "$TG_NAME" "$CF_TOKEN"
     cat << 'REMOTE_SCRIPT'
 #!/bin/bash
 
@@ -1507,21 +1555,21 @@ brief() {
     fi
 
     if [ ${#WARN[@]} -eq 0 ]; then
-        echo "✅ All good"
+        echo "All good"
     else
-        echo "⚠️ ${#WARN[@]} thing(s) to look at:"
+        echo "${#WARN[@]} thing(s) to look at:"
         printf '• %s\n' "${WARN[@]}"
     fi
     echo ""
-    echo "🔑 Logins (24h): $LOGIN_COUNT from $LOGIN_IPS IPs"
-    echo "🚫 Failed SSH attempts (24h): $FAIL_COUNT from $FAIL_IPS IPs · ${BANNED:-0} banned now"
-    echo "🌐 Open ports: $(ss -Hltun 2>/dev/null | awk '{
+    echo "Logins (24h): $LOGIN_COUNT from $LOGIN_IPS IPs"
+    echo "Failed SSH attempts (24h): $FAIL_COUNT from $FAIL_IPS IPs · ${BANNED:-0} banned now"
+    echo "Open ports: $(ss -Hltun 2>/dev/null | awk '{
         n = split($5, a, ":"); port = a[n]; addr = substr($5, 1, length($5) - length(port) - 1)
         if (addr !~ /^127\./ && addr != "[::1]") print $1 "/" port
     }' | sort -t/ -k2 -n -u | paste -sd, - | sed 's/,/, /g')"
-    echo "💾 Disk ${DISK}% · $MEM"
-    echo "🛡 Firewall $FIREWALL · fail2ban $F2B · clock $CLOCK$TUNNEL"
-    echo "⏱ $(uptime -p 2>/dev/null) · $REBOOT"
+    echo "Disk ${DISK}% · $MEM"
+    echo "Firewall $FIREWALL · fail2ban $F2B · clock $CLOCK$TUNNEL"
+    echo "$(uptime -p 2>/dev/null) · $REBOOT"
 }
 
 if [ "$1" = "--brief" ]; then
@@ -1691,7 +1739,13 @@ fi
 # starting point is set below, so none of our own changes get reported.
 if [ -n "$TG_TOKEN" ]; then
     mkdir -p /etc/serverus-sshnape
-    TG_LABEL=$(hostname -s 2>/dev/null || hostname)
+    # The name alerts start with and commands take. Given just now, or the one
+    # this server already had, or its hostname.
+    TG_LABEL=$TG_NAME
+    [ -n "$TG_LABEL" ] || TG_LABEL=$( . /etc/serverus-sshnape/telegram.env 2> /dev/null; echo "${TG_LABEL:-}" )
+    [ -n "$TG_LABEL" ] || TG_LABEL=$(hostname -s 2>/dev/null || hostname)
+    TG_LABEL=$(printf '%s' "$TG_LABEL" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9._-]+/-/g; s/^-+//; s/-+$//' | cut -c1-32)
+    [ -n "$TG_LABEL" ] || TG_LABEL=server
     ( umask 077; printf 'TG_TOKEN=%q\nTG_CHAT=%q\nTG_LABEL=%q\n' "$TG_TOKEN" "$TG_CHAT" "$TG_LABEL" > /etc/serverus-sshnape/telegram.env )
 fi
 
@@ -1741,7 +1795,7 @@ export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
     mv "$KNOWN.tmp" "$KNOWN"
 
     if [ -z "$LAST" ] || [ $((NOW - LAST)) -ge "$MONTH" ]; then
-        /usr/local/bin/send-alert "🔑 SSH login from a new IP"
+        /usr/local/bin/send-alert "SSH login from a new IP"
     fi
 ) < /dev/null > /dev/null 2>&1 &
 exit 0
@@ -1780,15 +1834,15 @@ if [ -n "$AUDIT_FROM" ] && [ "$AUDIT_FROM" -lt "$AUDIT_TO" ]; then
                 OWNERS=$(echo "$FILES" | while read -r FILE; do stat -c %U "${FILE%/.ssh/*}" 2>/dev/null; done | \
                     sort -u | paste -sd, - | sed 's/,/, /g')
                 OWNERS=${OWNERS:-an account}
-                HEAD="🔑 SSH login keys changed for $OWNERS"; FALLBACK="~/.ssh/authorized_keys"
+                HEAD="SSH login keys changed for $OWNERS"; FALLBACK="~/.ssh/authorized_keys"
                 IFNOT="Not you? Someone can now log in as $OWNERS. Check the file and remove any key you don't know, right away." ;;
-            ssh_config) HEAD="⚙️ SSH server config changed"; FALLBACK=/etc/ssh/
+            ssh_config) HEAD="SSH server config changed"; FALLBACK=/etc/ssh/
                 IFNOT="Not you? Someone may be opening a way in, like turning password login back on." ;;
-            sudoers) HEAD="👑 sudo rules changed"; FALLBACK=/etc/sudoers
+            sudoers) HEAD="sudo rules changed"; FALLBACK=/etc/sudoers
                 IFNOT="Not you? Someone may be giving an account full root rights." ;;
-            identity) HEAD="👤 Users, groups or passwords changed"; FALLBACK="/etc/passwd, /etc/shadow or /etc/group"
+            identity) HEAD="Users, groups or passwords changed"; FALLBACK="/etc/passwd, /etc/shadow or /etc/group"
                 IFNOT="Not you? Someone may have added an account or set a password to get back in." ;;
-            cron) HEAD="⏰ Scheduled jobs (cron) changed"; FALLBACK=/etc/cron*
+            cron) HEAD="Scheduled jobs (cron) changed"; FALLBACK=/etc/cron*
                 IFNOT="Not you? Attackers add cron jobs so they come back even after you kick them out." ;;
         esac
         FILES=$(echo "$FILES" | head -5 | paste -sd, - | sed 's/,/, /g')
@@ -1803,7 +1857,7 @@ echo "$NOW" > "$STATE/kernel.since"
 if [ -n "$SINCE" ] && [ "$SINCE" -lt "$NOW" ]; then
     KILLED=$(journalctl -k --since "@$SINCE" --until "@$((NOW - 1))" --no-pager -o cat 2>/dev/null | \
         sed -nE 's/.*Killed process [0-9]+ \(([^)]+)\).*/\1/p' | sort -u | paste -sd, -)
-    [ -n "$KILLED" ] && MSG+=$'\n\n'"💥 Out of memory - killed: $KILLED"
+    [ -n "$KILLED" ] && MSG+=$'\n\n'"Out of memory - killed: $KILLED"
 fi
 
 # Something new listening on a reachable address - your new app, or not.
@@ -1817,7 +1871,7 @@ CURRENT=$(ss -Hltun 2>/dev/null | awk '{
 if [ -f "$PORTS" ]; then
     NEW=$(comm -13 "$PORTS" <(echo "$CURRENT") | paste -sd, - | sed 's/,/, /g')
     if [ -n "$NEW" ]; then
-        MSG+=$'\n\n'"🌐 New listening port(s): $NEW"
+        MSG+=$'\n\n'"New listening port(s): $NEW"
         sort -u "$PORTS" <(echo "$CURRENT") > "$PORTS.tmp" && mv "$PORTS.tmp" "$PORTS"
     fi
 else
@@ -1828,12 +1882,12 @@ fi
 # a row alerts once (a restart is over by then), and so does coming back.
 if [ -f /etc/serverus-sshnape/tunnel-only ]; then
     if [ "$(/usr/local/lib/serverus-sshnape/tunnel-state)" = up ]; then
-        [ -f "$STATE/tunnel-alerted" ] && MSG+=$'\n\n'"☁️ Cloudflare Tunnel is connected again"
+        [ -f "$STATE/tunnel-alerted" ] && MSG+=$'\n\n'"Cloudflare Tunnel is connected again"
         rm -f "$STATE/tunnel-down" "$STATE/tunnel-alerted"
     elif [ ! -f "$STATE/tunnel-down" ]; then
         touch "$STATE/tunnel-down"
     elif [ ! -f "$STATE/tunnel-alerted" ]; then
-        MSG+=$'\n\n'"☁️ Cloudflare Tunnel is down - your sites are unreachable"$'\n'"Look: journalctl -u cloudflared -n 30"
+        MSG+=$'\n\n'"Cloudflare Tunnel is down - your sites are unreachable"$'\n'"Look: journalctl -u cloudflared -n 30"
         touch "$STATE/tunnel-alerted"
     fi
 fi
@@ -1841,7 +1895,7 @@ fi
 # Monday morning check-in, so silence can't be mistaken for "all good"
 DIGEST="$STATE/digest-sent"
 if [ "$(date -u +%u%H)" = "108" ] && { [ ! -f "$DIGEST" ] || [ $((NOW - $(stat -c %Y "$DIGEST"))) -ge 518400 ]; }; then
-    /usr/local/bin/send-alert "📅 Weekly check-in
+    /usr/local/bin/send-alert "Weekly check-in
 $(/usr/local/bin/security-check --brief)" && touch "$DIGEST"
 fi
 
@@ -1850,7 +1904,7 @@ DISK=$(df -P / | awk 'NR == 2 {gsub("%", "", $5); print $5}')
 if [ "$DISK" -ge 90 ]; then
     FLAG="$STATE/disk-alerted"
     if [ ! -f "$FLAG" ] || [ $((NOW - $(stat -c %Y "$FLAG"))) -ge 86400 ]; then
-        MSG+=$'\n\n'"💾 Disk is ${DISK}% full"
+        MSG+=$'\n\n'"Disk is ${DISK}% full"
         touch "$FLAG"
     fi
 else
@@ -1902,24 +1956,59 @@ After=network-online.target
 
 [Service]
 Type=oneshot
-ExecStart=/bin/sh -c 'for i in 1 2 3 4 5 6 7 8 9 10; do /usr/local/bin/send-alert "🔄 Server booted" && exit 0; sleep 10; done'
+ExecStart=/bin/sh -c 'for i in 1 2 3 4 5 6 7 8 9 10; do /usr/local/bin/send-alert "Server booted" && exit 0; sleep 10; done'
 
 [Install]
 WantedBy=multi-user.target
 EOF
 
-    # Answers /status in Telegram. Python because it has to parse Telegram's
+    # Turns alerts off again. The bot runs it on /remove, or you do by hand.
+    cat > /usr/local/lib/serverus-sshnape/telegram-off << 'EOF'
+#!/bin/bash
+# Stops this server's Telegram alerts and forgets the bot's token. The bot runs
+# it on "/remove <name>"; by hand it does the same. To turn alerts back on, run
+# the setup script again and answer yes to Telegram.
+systemctl disable --now serverus-sshnape-watch.timer serverus-sshnape-boot-alert.service > /dev/null 2>&1
+systemctl stop serverus-sshnape-watch.service > /dev/null 2>&1
+sed -i '\|pam_exec.so quiet /usr/local/lib/serverus-sshnape/login-alert|d' /etc/pam.d/sshd
+rm -f /etc/serverus-sshnape/telegram.env
+rm -f /etc/systemd/system/serverus-sshnape-watch.service /etc/systemd/system/serverus-sshnape-watch.timer \
+    /etc/systemd/system/serverus-sshnape-boot-alert.service
+systemctl disable serverus-sshnape-bot.service > /dev/null 2>&1
+rm -f /etc/systemd/system/serverus-sshnape-bot.service
+systemctl daemon-reload
+# Last: when the bot itself started this, stopping the bot can end this script
+systemctl stop serverus-sshnape-bot.service > /dev/null 2>&1
+exit 0
+EOF
+    chmod 755 /usr/local/lib/serverus-sshnape/telegram-off
+
+    # Answers commands in Telegram. Python because it has to parse Telegram's
     # JSON replies; python3 is already here as a fail2ban dependency.
     cat > /usr/local/lib/serverus-sshnape/bot.py << 'EOF'
 #!/usr/bin/env python3
-"""Answers /status in Telegram with the security-check verdict.
+"""Answers Telegram commands for this server.
+
+One bot serves any number of servers. Each server runs this program, and they
+all read the same incoming messages: Telegram keeps handing a message out until
+someone confirms it, so no server confirms a message before every server has
+had time to read it.
 
 Only the chat picked during setup gets an answer; everyone else is ignored.
-It runs one fixed, read-only command - nothing typed in Telegram is executed.
+Nothing typed in Telegram is executed. Every command maps to one fixed action:
+  /status [name]        the security-check verdict (read-only)
+  /servers              one line from every server (read-only)
+  /reboot <name>        reboot this server
+  /shutdown <name> yes  power this server off
+  /remove <name>        stop this server's alerts and forget the bot
+The three that change something only act when they carry this server's name.
 """
+import email.utils
 import json
+import random
 import subprocess
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 
@@ -1928,22 +2017,58 @@ TOKEN, CHAT, LABEL = subprocess.check_output(
     ["bash", "-c", '. /etc/serverus-sshnape/telegram.env && printf "%s\\n%s\\n%s" "$TG_TOKEN" "$TG_CHAT" "$TG_LABEL"'],
     universal_newlines=True,
 ).split("\n")
+NAME = LABEL.lower()
 
-HELP = "Send /status for a quick health check."
+API = "https://api.telegram.org"
+POLL = 3    # seconds between looks at the incoming messages
+KEEP = 120  # seconds a message is left for the other servers to read
+ONLY_MESSAGES = json.dumps(["message"])
+
+# Telegram's clock, from its answers. Message times are Telegram's too, so a
+# server whose own clock is wrong can't throw away messages the others need.
+clock = 0
 
 
 def api(method, params, timeout=20):
-    url = "https://api.telegram.org/bot{}/{}".format(TOKEN, method)
+    global clock
+    url = "{}/bot{}/{}".format(API, TOKEN, method)
     data = urllib.parse.urlencode(params).encode()
     with urllib.request.urlopen(url, data, timeout=timeout) as response:
+        try:
+            clock = email.utils.parsedate_to_datetime(response.headers["Date"]).timestamp()
+        except Exception:
+            clock = clock or time.time()
         return json.loads(response.read().decode())
 
 
-def reply(text):
+def reply(text, gap=" "):
+    """Send to the chat. Several servers may answer at once, and Telegram
+    slows a busy chat down: it says how long to wait, so wait and try again."""
+    for _ in range(6):
+        try:
+            api("sendMessage", {"chat_id": CHAT, "text": "[{}]{}{}".format(LABEL, gap, text)[:4000]})
+            return True
+        except urllib.error.HTTPError as error:
+            wait = 2
+            try:
+                wait = json.loads(error.read().decode())["parameters"]["retry_after"]
+            except Exception:
+                pass
+            time.sleep(min(wait, 30) + random.random() * 2)
+        except Exception:
+            time.sleep(2)
+    return False
+
+
+def check():
     try:
-        api("sendMessage", {"chat_id": CHAT, "text": text[:4000]})
-    except Exception:
-        pass
+        return subprocess.run(
+            ["/usr/local/bin/security-check", "--brief"],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            universal_newlines=True, timeout=90,
+        ).stdout.strip()
+    except subprocess.TimeoutExpired:
+        return "security-check timed out"
 
 
 def status():
@@ -1951,55 +2076,133 @@ def status():
         api("sendChatAction", {"chat_id": CHAT, "action": "typing"})
     except Exception:
         pass
+    reply(check(), "\n")
+
+
+def one_line():
+    verdict = (check().split("\n") or [""])[0].rstrip(":")
     try:
-        out = subprocess.run(
-            ["/usr/local/bin/security-check", "--brief"],
-            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-            universal_newlines=True, timeout=90,
-        ).stdout
-    except subprocess.TimeoutExpired:
-        out = "security-check timed out"
-    return "[{}]\n{}".format(LABEL, out.strip())
+        up = subprocess.check_output(["uptime", "-p"], stderr=subprocess.DEVNULL, universal_newlines=True).strip()
+    except Exception:
+        up = ""
+    reply(" · ".join(part for part in (verdict, up) if part))
+
+
+def run(*command):
+    return subprocess.run(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode
+
+
+def remove():
+    reply("Removed. No more alerts from this server and it no longer answers here. "
+          "To add it back, run the setup script on it again.")
+    off = "/usr/local/lib/serverus-sshnape/telegram-off"
+    # As its own unit, so it survives stopping this service
+    if run("systemd-run", "--quiet", "--collect", off) != 0:
+        run(off)
+    time.sleep(60)
+
+
+def handle(text):
+    words = text.strip().lower().split()
+    if not words:
+        return
+    command = words[0].split("@")[0]
+    target = words[1] if len(words) > 1 else ""
+    mine = target == NAME
+
+    if command in ("/status", "status"):
+        if mine or not target:
+            status()
+    elif command in ("/servers", "/start", "/help"):
+        one_line()
+    elif command == "/reboot":
+        if mine:
+            reply("Rebooting now. You get a message when it is back.")
+            run("systemctl", "--no-block", "reboot")
+            time.sleep(60)
+        elif not target:
+            reply("To reboot this server: /reboot {}".format(LABEL))
+    elif command == "/shutdown":
+        if mine and words[2:3] == ["yes"]:
+            reply("Shutting down now. It stays off until you start it in your provider's panel.")
+            run("systemctl", "--no-block", "poweroff")
+            time.sleep(60)
+        elif mine:
+            reply("This turns the server off. It only comes back from your provider's panel, "
+                  "not from here. To do it: /shutdown {} yes".format(LABEL))
+        elif not target:
+            reply("To shut this server down: /shutdown {} yes".format(LABEL))
+    elif command == "/remove":
+        if mine:
+            remove()
+        elif not target:
+            reply("To stop alerts from this server: /remove {}".format(LABEL))
+    # Anything else: silence. With many servers on one bot, a typo would
+    # otherwise be answered by every one of them.
 
 
 try:
-    api("setMyCommands", {"commands": json.dumps(
-        [{"command": "status", "description": "How is the server doing?"}])})
+    api("setMyCommands", {"commands": json.dumps([
+        {"command": "status", "description": "Health check. One server: /status name"},
+        {"command": "servers", "description": "Which servers are on this bot"},
+        {"command": "reboot", "description": "Reboot a server: /reboot name"},
+        {"command": "shutdown", "description": "Power a server off: /shutdown name"},
+        {"command": "remove", "description": "Stop a server's alerts: /remove name"},
+    ])})
 except Exception:
     pass
 
-started = time.time()
-offset = None
+started = None  # Telegram's time when we first looked; older messages are not for us
+seen = {}       # update_id -> message time, for the messages already handled
 while True:
-    params = {"timeout": 50, "allowed_updates": json.dumps(["message"])}
-    if offset is not None:
-        params["offset"] = offset
+    time.sleep(POLL + random.random())
     try:
-        updates = api("getUpdates", params, timeout=70).get("result", [])
+        # No offset: asks from the oldest unconfirmed message and confirms nothing
+        updates = api("getUpdates", {"timeout": 0, "limit": 100, "allowed_updates": ONLY_MESSAGES}).get("result", [])
     except Exception:
-        time.sleep(10)
+        # Also where it lands when two servers ask in the same instant (409)
+        time.sleep(2 + random.random() * 3)
+        continue
+    if started is None:
+        # A reboot we were told to do must not be done again after the reboot
+        started = clock
+    if not updates:
         continue
 
+    fresh = []
     for update in updates:
-        offset = update["update_id"] + 1
         message = update.get("message") or {}
+        sent = message.get("date", 0)
+        if clock - sent <= KEEP:
+            fresh.append(update["update_id"])
+        if update["update_id"] in seen:
+            continue
+        seen[update["update_id"]] = sent
+        if sent < started or clock - sent > KEEP:
+            continue
         if str(message.get("chat", {}).get("id")) != CHAT:
             continue
-        # Don't answer a backlog of old messages after a restart or reboot
-        if message.get("date", 0) < started - 300:
-            continue
-        words = (message.get("text") or "").strip().lower().split()
-        command = words[0].split("@")[0] if words else ""
-        if command in ("/status", "status"):
-            reply(status())
-        else:
-            reply(HELP)
+        handle(message.get("text") or "")
+
+    # Confirm what every server has had its two minutes with. A full page means
+    # a flood (anyone can write to a bot): confirm it all, or commands never surface.
+    if len(updates) >= 100 or not fresh:
+        confirm = updates[-1]["update_id"] + 1
+    else:
+        confirm = min(fresh)
+    if confirm > updates[0]["update_id"]:
+        try:
+            api("getUpdates", {"offset": confirm, "timeout": 0, "limit": 1, "allowed_updates": ONLY_MESSAGES})
+        except Exception:
+            pass
+    for update_id in [u for u, sent in seen.items() if clock - sent > KEEP * 5]:
+        del seen[update_id]
 EOF
     chmod 755 /usr/local/lib/serverus-sshnape/bot.py
 
     cat > /etc/systemd/system/serverus-sshnape-bot.service << 'EOF'
 [Unit]
-Description=Telegram bot answering /status
+Description=Telegram bot answering for this server
 Wants=network-online.target
 After=network-online.target
 
@@ -2042,7 +2245,7 @@ EOF
     systemctl restart serverus-sshnape-bot.service > /dev/null 2>&1 || true
 
     if [ -n "$TG_TOKEN" ]; then
-        if /usr/local/bin/send-alert "✅ Server set up. Alerts on: logins from new IPs, changed SSH keys/config/users/sudoers/cron, new listening ports, OOM kills, disk over 90%, reboots. Check-in every Monday. Send /status for a health check."; then
+        if /usr/local/bin/send-alert "Server set up. Alerts on: logins from new IPs, changed SSH keys/config/users/sudoers/cron, new listening ports, OOM kills, disk over 90%, reboots. Check-in every Monday. /status for a health check, /servers for every server on this bot."; then
             ok "Telegram: test message sent"
         else
             warn "Telegram: test message failed. On the server: send-alert test"
@@ -2181,7 +2384,7 @@ print_step "Done"
 echo "Connect:      ssh root@$SERVER"
 echo "Key:          $KEY_PATH"
 echo "On server:    security-check · fail2ban-client status sshd · aureport --login"
-[ -n "$TELEGRAM" ] && echo "Telegram:     /status any time · send-alert \"text\" from your own jobs"
+[ -n "$TELEGRAM" ] && echo "Telegram:     /status, /servers, /reboot, /shutdown, /remove · send-alert \"text\" from your own jobs"
 [ "$TUNNEL_STATUS" = "up" ] && echo "Tunnel:       systemctl status cloudflared · journalctl -u cloudflared"
 echo ""
 echo "1. Back up the key now. It is the only way in; the root password is locked."
